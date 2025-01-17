@@ -2,9 +2,9 @@ import base64
 import json
 from collections import OrderedDict
 
-from drf_yasg2 import openapi
-from drf_yasg2.inspectors import PaginatorInspector
-from flag_engine.identities.builders import build_identity_model
+from drf_yasg import openapi
+from drf_yasg.inspectors import PaginatorInspector
+from flag_engine.identities.models import IdentityModel
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 
@@ -64,6 +64,9 @@ class EdgeIdentityPaginationInspector(PaginatorInspector):
 
 
 class EdgeIdentityPagination(CustomPagination):
+    max_page_size = 100
+    page_size = 100
+
     def paginate_queryset(self, dynamo_queryset, request, view=None):
         last_evaluated_key = dynamo_queryset.get("LastEvaluatedKey")
         if last_evaluated_key:
@@ -72,7 +75,7 @@ class EdgeIdentityPagination(CustomPagination):
             )
 
         return [
-            build_identity_model(identity_document)
+            IdentityModel.model_validate(identity_document)
             for identity_document in dynamo_queryset["Items"]
         ]
 
@@ -91,9 +94,11 @@ class EdgeIdentityPagination(CustomPagination):
                     ("results", data),
                     (
                         "last_evaluated_key",
-                        self.last_evaluated_key
-                        if hasattr(self, "last_evaluated_key")
-                        else None,
+                        (
+                            self.last_evaluated_key
+                            if hasattr(self, "last_evaluated_key")
+                            else None
+                        ),
                     ),
                 ]
             )

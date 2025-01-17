@@ -1,31 +1,188 @@
-import pytest
-from django.core.cache import cache
-from rest_framework.authtoken.models import Token
-from rest_framework.test import APIClient
+import logging
+import os
+import typing
+from unittest.mock import MagicMock
 
-from api_keys.models import MasterAPIKey
-from environments.identities.models import Identity
-from environments.identities.traits.models import Trait
-from environments.models import Environment, EnvironmentAPIKey
-from environments.permissions.constants import (
+import boto3
+import pytest
+from common.environments.permissions import (
     MANAGE_IDENTITIES,
     VIEW_ENVIRONMENT,
     VIEW_IDENTITIES,
 )
-from environments.permissions.models import UserEnvironmentPermission
+from common.projects.permissions import VIEW_PROJECT
+from django.contrib.contenttypes.models import ContentType
+from django.core.cache import caches
+from django.db.backends.base.creation import TEST_DATABASE_PREFIX
+from django.test.utils import setup_databases
+from flag_engine.segments.constants import EQUAL
+from moto import mock_dynamodb
+from mypy_boto3_dynamodb.service_resource import DynamoDBServiceResource, Table
+from pytest_django.fixtures import SettingsWrapper
+from pytest_django.plugin import blocking_manager_key
+from pytest_mock import MockerFixture
+from rest_framework.authtoken.models import Token
+from rest_framework.test import APIClient
+from task_processor.task_run_method import TaskRunMethod
+from urllib3 import HTTPResponse
+from urllib3.connectionpool import HTTPConnectionPool
+from xdist import get_xdist_worker_id
+
+from api_keys.models import MasterAPIKey
+from api_keys.user import APIKeyUser
+from environments.identities.models import Identity
+from environments.identities.traits.models import Trait
+from environments.models import Environment, EnvironmentAPIKey
+from environments.permissions.models import (
+    UserEnvironmentPermission,
+    UserPermissionGroupEnvironmentPermission,
+)
+from features.feature_external_resources.models import FeatureExternalResource
 from features.feature_types import MULTIVARIATE
 from features.models import Feature, FeatureSegment, FeatureState
 from features.multivariate.models import MultivariateFeatureOption
 from features.value_types import STRING
+from features.versioning.tasks import enable_v2_versioning
 from features.workflows.core.models import ChangeRequest
+from integrations.github.models import GithubConfiguration, GitHubRepository
+from metadata.models import (
+    Metadata,
+    MetadataField,
+    MetadataModelField,
+    MetadataModelFieldRequirement,
+)
 from organisations.models import Organisation, OrganisationRole, Subscription
-from organisations.subscriptions.constants import CHARGEBEE, XERO
+from organisations.permissions.models import (
+    OrganisationPermissionModel,
+    UserOrganisationPermission,
+)
+from organisations.permissions.permissions import (
+    CREATE_PROJECT,
+    MANAGE_USER_GROUPS,
+)
+from organisations.subscriptions.constants import (
+    CHARGEBEE,
+    FREE_PLAN_ID,
+    SCALE_UP,
+    STARTUP,
+    XERO,
+)
 from permissions.models import PermissionModel
-from projects.models import Project, UserProjectPermission
+from projects.models import (
+    Project,
+    UserPermissionGroupProjectPermission,
+    UserProjectPermission,
+)
 from projects.tags.models import Tag
-from segments.models import EQUAL, Condition, Segment, SegmentRule
-from task_processor.task_run_method import TaskRunMethod
+from segments.models import Condition, Segment, SegmentRule
+from tests.test_helpers import fix_issue_3869
+from tests.types import (
+    WithEnvironmentPermissionsCallable,
+    WithOrganisationPermissionsCallable,
+    WithProjectPermissionsCallable,
+)
 from users.models import FFAdminUser, UserPermissionGroup
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--ci",
+        action="store_true",
+        default=False,
+        help="Enable CI mode",
+    )
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    fix_issue_3869()
+
+
+@pytest.fixture()
+def post_request_mock(mocker: MockerFixture) -> MagicMock:
+    def mocked_request(*args, **kwargs) -> None:
+        class MockResponse:
+            def __init__(self, json_data: str, status_code: int) -> None:
+                self.json_data = json_data
+                self.status_code = status_code
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> str:
+                return self.json_data
+
+        return MockResponse(json_data={"data": "data"}, status_code=200)
+
+    return mocker.patch("requests.post", side_effect=mocked_request)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_configure(config: pytest.Config) -> None:
+    if (
+        config.option.ci
+        and config.option.dist != "no"
+        and not hasattr(config, "workerinput")
+    ):
+        with config.stash[blocking_manager_key].unblock():
+            setup_databases(
+                verbosity=config.option.verbose,
+                interactive=False,
+                parallel=config.option.numprocesses,
+            )
+
+
+@pytest.fixture(scope="session")
+def django_db_setup(request: pytest.FixtureRequest) -> None:
+    if (
+        request.config.option.ci
+        # xdist worker id is either `gw[0-9]+` or `master`
+        and (xdist_worker_id_suffix := get_xdist_worker_id(request)[2:]).isnumeric()
+    ):
+        # Django's test database clone indices start at 1,
+        # Pytest's worker indices are 0-based
+        test_db_suffix = str(int(xdist_worker_id_suffix) + 1)
+    else:
+        # Tests are run on main node, which assumes -n0
+        return request.getfixturevalue("django_db_setup")  # pragma: no cover
+
+    from django.conf import settings
+
+    for db_settings in settings.DATABASES.values():
+        test_db_name = f'{TEST_DATABASE_PREFIX}{db_settings["NAME"]}_{test_db_suffix}'
+        db_settings["NAME"] = test_db_name
+
+
+@pytest.fixture(autouse=True)
+def restrict_http_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    This fixture prevents all tests from performing HTTP requests to
+    any host than `localhost`.
+
+    Any external request attempt leads to `RuntimeError` with a helpful message
+    pointing developers to the `responses` fixture.
+    """
+    allowed_hosts = {"localhost"}
+    original_urlopen = HTTPConnectionPool.urlopen
+
+    def urlopen_mock(
+        self,
+        method: str,
+        url: str,
+        *args,
+        **kwargs,
+    ) -> HTTPResponse:
+        if self.host in allowed_hosts:
+            return original_urlopen(self, method, url, *args, **kwargs)
+
+        raise RuntimeError(
+            f"Blocked {method} request to {self.scheme}://{self.host}{url}. "
+            "Use `responses` fixture to mock the response!"
+        )
+
+    monkeypatch.setattr(
+        "urllib3.connectionpool.HTTPConnectionPool.urlopen", urlopen_mock
+    )
+
 
 trait_key = "key1"
 trait_value = "value1"
@@ -42,10 +199,30 @@ def auth_token(test_user):
 
 
 @pytest.fixture()
-def admin_client(admin_user):
+def admin_client_original(admin_user):
     client = APIClient()
     client.force_authenticate(user=admin_user)
     return client
+
+
+@pytest.fixture()
+def admin_client(admin_client_original):
+    """
+    This fixture will eventually be switched over to what is now
+    called admin_client_new which will run an admin client as well
+    as admin_master_api_key_client automatically.
+
+    In the meantime consider this fixture as deprecated. Use either
+    admin_client_original to preserve a singular admin client or
+    if the test suite can handle it, use admin_client_new to
+    automatically handling both query methods.
+
+    If a test must use pytest.mark.parametrize to differentiate
+    between other required parameters for a test then please
+    use admin_client_original as the parametrized version as this
+    fixture will ultimately be updated to the new approach.
+    """
+    yield admin_client_original
 
 
 @pytest.fixture()
@@ -55,9 +232,31 @@ def test_user_client(api_client, test_user):
 
 
 @pytest.fixture()
-def organisation(db, admin_user):
+def staff_user(django_user_model):
+    """
+    A non-admin user fixture.
+
+    To add to an environment with permissions use the fixture
+    with_environment_permissions, or similar with the fixture
+
+
+    This fixture is attached to the organisation fixture.
+    """
+    return django_user_model.objects.create(email="staff@example.com")
+
+
+@pytest.fixture()
+def staff_client(staff_user):
+    client = APIClient()
+    client.force_authenticate(user=staff_user)
+    return client
+
+
+@pytest.fixture()
+def organisation(db, admin_user, staff_user):
     org = Organisation.objects.create(name="Test Org")
     admin_user.add_organisation(org, role=OrganisationRole.ADMIN)
+    staff_user.add_organisation(org, role=OrganisationRole.USER)
     return org
 
 
@@ -98,10 +297,11 @@ def xero_subscription(organisation):
 
 
 @pytest.fixture()
-def chargebee_subscription(organisation):
+def chargebee_subscription(organisation: Organisation) -> Subscription:
     subscription = Subscription.objects.get(organisation=organisation)
     subscription.payment_method = CHARGEBEE
     subscription.subscription_id = "subscription-id"
+    subscription.plan = "scale-up-v2"
     subscription.save()
 
     # refresh organisation to load subscription
@@ -110,18 +310,71 @@ def chargebee_subscription(organisation):
 
 
 @pytest.fixture()
-def project(organisation):
-    return Project.objects.create(name="Test Project", organisation=organisation)
-
-
-@pytest.fixture()
 def tag(project):
     return Tag.objects.create(label="tag", project=project, color="#000000")
 
 
 @pytest.fixture()
-def segment(project):
-    return Segment.objects.create(name="segment", project=project)
+def system_tag(project: Project) -> Tag:
+    return Tag.objects.create(
+        label="system-tag", project=project, color="#FFFFFF", is_system_tag=True
+    )
+
+
+@pytest.fixture()
+def enterprise_subscription(organisation: Organisation) -> Subscription:
+    Subscription.objects.filter(organisation=organisation).update(
+        plan="enterprise", subscription_id="subscription-id"
+    )
+    organisation.refresh_from_db()
+    return organisation.subscription
+
+
+@pytest.fixture()
+def startup_subscription(organisation: Organisation) -> Subscription:
+    Subscription.objects.filter(organisation=organisation).update(
+        plan=STARTUP, subscription_id="subscription-id"
+    )
+    organisation.refresh_from_db()
+    return organisation.subscription
+
+
+@pytest.fixture()
+def scale_up_subscription(organisation: Organisation) -> Subscription:
+    Subscription.objects.filter(organisation=organisation).update(
+        plan=SCALE_UP, subscription_id="subscription-id"
+    )
+    organisation.refresh_from_db()
+    return organisation.subscription
+
+
+@pytest.fixture()
+def free_subscription(organisation: Organisation) -> Subscription:
+    Subscription.objects.filter(organisation=organisation).update(
+        plan=FREE_PLAN_ID, subscription_id="subscription-id"
+    )
+    organisation.refresh_from_db()
+    return organisation.subscription
+
+
+@pytest.fixture()
+def project(organisation):
+    return Project.objects.create(name="Test Project", organisation=organisation)
+
+
+@pytest.fixture()
+def segment(project: Project):
+    _segment = Segment.objects.create(name="segment", project=project)
+    # Deep clone the segment to ensure that any bugs around
+    # versioning get bubbled up through the test suite.
+    _segment.deep_clone()
+
+    return _segment
+
+
+@pytest.fixture()
+def another_segment(project: Project) -> Segment:
+    return Segment.objects.create(name="another_segment", project=project)
 
 
 @pytest.fixture()
@@ -130,13 +383,110 @@ def segment_rule(segment):
 
 
 @pytest.fixture()
+def feature_specific_segment(feature: Feature) -> Segment:
+    return Segment.objects.create(
+        feature=feature, name="feature specific segment", project=feature.project
+    )
+
+
+@pytest.fixture()
 def environment(project):
     return Environment.objects.create(name="Test Environment", project=project)
 
 
 @pytest.fixture()
+def with_environment_permissions(
+    environment: Environment, staff_user: FFAdminUser
+) -> WithEnvironmentPermissionsCallable:
+    """
+    Add environment permissions to the staff_user fixture.
+    Defaults to associating to the environment fixture.
+    """
+
+    def _with_environment_permissions(
+        permission_keys: list[str] | None = None,
+        environment_id: int | None = None,
+        admin: bool = False,
+    ) -> UserEnvironmentPermission:
+        environment_id = environment_id or environment.id
+        uep, __ = UserEnvironmentPermission.objects.get_or_create(
+            environment_id=environment_id, user=staff_user, defaults={"admin": admin}
+        )
+        if permission_keys:
+            uep.permissions.add(*permission_keys)
+
+        return uep
+
+    return _with_environment_permissions
+
+
+@pytest.fixture()
+def with_organisation_permissions(
+    organisation: Organisation, staff_user: FFAdminUser
+) -> WithOrganisationPermissionsCallable:
+    """
+    Add organisation permissions to the staff_user fixture.
+    Defaults to associating to the organisation fixture.
+    """
+
+    def _with_organisation_permissions(
+        permission_keys: list[str], organisation_id: int | None = None
+    ) -> UserOrganisationPermission:
+        organisation_id = organisation_id or organisation.id
+        uop, __ = UserOrganisationPermission.objects.get_or_create(
+            organisation_id=organisation_id, user=staff_user
+        )
+        uop.permissions.add(*permission_keys)
+
+        return uop
+
+    return _with_organisation_permissions
+
+
+@pytest.fixture()
+def with_project_permissions(
+    project: Project, staff_user: FFAdminUser
+) -> WithProjectPermissionsCallable:
+    """
+    Add project permissions to the staff_user fixture.
+    Defaults to associating to the project fixture.
+    """
+
+    def _with_project_permissions(
+        permission_keys: list[str] | None = None,
+        project_id: typing.Optional[int] = None,
+        admin: bool = False,
+    ) -> UserProjectPermission:
+        project_id = project_id or project.id
+        upp, __ = UserProjectPermission.objects.get_or_create(
+            project_id=project_id, user=staff_user, admin=admin
+        )
+
+        if permission_keys:
+            upp.permissions.add(*permission_keys)
+
+        return upp
+
+    return _with_project_permissions
+
+
+@pytest.fixture()
+def environment_v2_versioning(environment):
+    enable_v2_versioning(environment.id)
+    environment.refresh_from_db()
+    return environment
+
+
+@pytest.fixture()
 def identity(environment):
     return Identity.objects.create(identifier="test_identity", environment=environment)
+
+
+@pytest.fixture()
+def identity_featurestate(identity, feature):
+    return FeatureState.objects.create(
+        identity=identity, feature=feature, environment=identity.environment
+    )
 
 
 @pytest.fixture()
@@ -165,6 +515,13 @@ def multivariate_feature(project):
 
 
 @pytest.fixture()
+def multivariate_options(
+    multivariate_feature: Feature,
+) -> list[MultivariateFeatureOption]:
+    return list(multivariate_feature.multivariate_options.all())
+
+
+@pytest.fixture()
 def identity_matching_segment(project, trait):
     segment = Segment.objects.create(name="Matching segment", project=project)
     matching_rule = SegmentRule.objects.create(
@@ -185,20 +542,50 @@ def api_client():
 
 
 @pytest.fixture()
-def feature(project, environment):
+def feature(project: Project, environment: Environment) -> Feature:
     return Feature.objects.create(name="Test Feature1", project=project)
 
 
 @pytest.fixture()
-def change_request(environment, admin_user):
+def change_request(environment: Environment, admin_user: FFAdminUser) -> ChangeRequest:
     return ChangeRequest.objects.create(
         environment=environment, title="Test CR", user_id=admin_user.id
     )
 
 
 @pytest.fixture()
-def feature_state(feature, environment):
-    return FeatureState.objects.filter(environment=environment, feature=feature).first()
+def project_change_request(project: Project, admin_user: FFAdminUser) -> ChangeRequest:
+    return ChangeRequest.objects.create(
+        project=project, title="Test Project CR", user_id=admin_user.id
+    )
+
+
+@pytest.fixture()
+def feature_state(feature: Feature, environment: Environment) -> FeatureState:
+    return FeatureState.objects.get(environment=environment, feature=feature)
+
+
+@pytest.fixture()
+def feature_state_with_value(environment: Environment) -> FeatureState:
+    feature = Feature.objects.create(
+        name="feature_with_value",
+        initial_value="foo",
+        default_enabled=True,
+        project=environment.project,
+    )
+    return FeatureState.objects.get(
+        environment=environment, feature=feature, feature_segment=None, identity=None
+    )
+
+
+@pytest.fixture()
+def feature_with_value(project: Project, environment: Environment) -> Feature:
+    return Feature.objects.create(
+        name="feature_with_value",
+        initial_value="value",
+        default_enabled=False,
+        project=environment.project,
+    )
 
 
 @pytest.fixture()
@@ -223,9 +610,15 @@ def reset_cache():
     # https://groups.google.com/g/django-developers/c/zlaPsP13dUY
     # TL;DR: Use this if your test interacts with cache since django
     # does not clear cache after every test
-    cache.clear()
+    # Clear all caches before the test
+    for cache in caches.all():
+        cache.clear()
+
     yield
-    cache.clear()
+
+    # Clear all caches after the test
+    for cache in caches.all():
+        cache.clear()
 
 
 @pytest.fixture()
@@ -243,6 +636,42 @@ def segment_featurestate(feature_segment, feature, environment):
 
 
 @pytest.fixture()
+def another_segment_featurestate(
+    feature: Feature, environment: Environment, another_segment: Segment
+) -> FeatureState:
+    return FeatureState.objects.create(
+        feature_segment=FeatureSegment.objects.create(
+            feature=feature, segment=another_segment, environment=environment
+        ),
+        feature=feature,
+        environment=environment,
+    )
+
+
+@pytest.fixture()
+def feature_with_value_segment(
+    feature_with_value: Feature, segment: Segment, environment: Environment
+) -> FeatureSegment:
+    return FeatureSegment.objects.create(
+        feature=feature_with_value, segment=segment, environment=environment
+    )
+
+
+@pytest.fixture()
+def segment_override_for_feature_with_value(
+    feature_with_value_segment: FeatureSegment,
+    feature_with_value: Feature,
+    environment: Environment,
+) -> FeatureState:
+    return FeatureState.objects.create(
+        feature_segment=feature_with_value_segment,
+        feature=feature_with_value,
+        environment=environment,
+        updated_at="2024-01-01 00:00:00",
+    )
+
+
+@pytest.fixture()
 def environment_api_key(environment):
     return EnvironmentAPIKey.objects.create(
         environment=environment, name="Test API Key"
@@ -250,40 +679,97 @@ def environment_api_key(environment):
 
 
 @pytest.fixture()
-def master_api_key(organisation):
+def master_api_key_name() -> str:
+    return "test-key"
+
+
+@pytest.fixture()
+def admin_master_api_key(organisation: Organisation) -> typing.Tuple[MasterAPIKey, str]:
     master_api_key, key = MasterAPIKey.objects.create_key(
-        name="test_key", organisation=organisation
+        name="test_key", organisation=organisation, is_admin=True
     )
     return master_api_key, key
 
 
 @pytest.fixture()
-def master_api_key_client(master_api_key):
+def master_api_key(
+    master_api_key_name: str, organisation: Organisation
+) -> typing.Tuple[MasterAPIKey, str]:
+    master_api_key, key = MasterAPIKey.objects.create_key(
+        name=master_api_key_name, organisation=organisation, is_admin=False
+    )
+    return master_api_key, key
+
+
+@pytest.fixture()
+def admin_user_email(admin_user: FFAdminUser) -> str:
+    return admin_user.email
+
+
+@pytest.fixture
+def master_api_key_object(
+    master_api_key: typing.Tuple[MasterAPIKey, str]
+) -> MasterAPIKey:
+    return master_api_key[0]
+
+
+@pytest.fixture
+def master_api_key_id(master_api_key_object: MasterAPIKey) -> str:
+    return master_api_key_object.id
+
+
+@pytest.fixture
+def admin_user_id(admin_user: FFAdminUser) -> str:
+    return admin_user.id
+
+
+@pytest.fixture
+def admin_master_api_key_object(
+    admin_master_api_key: typing.Tuple[MasterAPIKey, str]
+) -> MasterAPIKey:
+    return admin_master_api_key[0]
+
+
+@pytest.fixture
+def api_key_user(master_api_key_object: MasterAPIKey) -> APIKeyUser:
+    return APIKeyUser(master_api_key_object)
+
+
+@pytest.fixture()
+def admin_master_api_key_client(
+    admin_master_api_key: typing.Tuple[MasterAPIKey, str]
+) -> APIClient:
+    key = admin_master_api_key[1]
     # Can not use `api_client` fixture here because:
     # https://docs.pytest.org/en/6.2.x/fixture.html#fixtures-can-be-requested-more-than-once-per-test-return-values-are-cached
     api_client = APIClient()
-    api_client.credentials(HTTP_AUTHORIZATION="Api-Key " + master_api_key[1])
+    api_client.credentials(HTTP_AUTHORIZATION="Api-Key " + key)
     return api_client
 
 
 @pytest.fixture()
-def view_environment_permission():
+def view_environment_permission(db):
     return PermissionModel.objects.get(key=VIEW_ENVIRONMENT)
 
 
 @pytest.fixture()
-def manage_identities_permission():
+def manage_identities_permission(db):
     return PermissionModel.objects.get(key=MANAGE_IDENTITIES)
 
 
 @pytest.fixture()
-def view_identities_permission():
+def view_identities_permission(db):
     return PermissionModel.objects.get(key=VIEW_IDENTITIES)
 
 
 @pytest.fixture()
-def view_project_permission():
-    return PermissionModel.objects.get(key="VIEW_PROJECT")
+def view_project_permission(db):
+    return PermissionModel.objects.get(key=VIEW_PROJECT)
+
+
+@pytest.fixture()
+def create_project_permission(db):
+    return PermissionModel.objects.get(key=CREATE_PROJECT)
 
 
 @pytest.fixture()
@@ -294,10 +780,455 @@ def user_environment_permission(test_user, environment):
 
 
 @pytest.fixture()
+def user_environment_permission_group(test_user, user_permission_group, environment):
+    return UserPermissionGroupEnvironmentPermission.objects.create(
+        group=user_permission_group, environment=environment
+    )
+
+
+@pytest.fixture()
 def user_project_permission(test_user, project):
     return UserProjectPermission.objects.create(user=test_user, project=project)
+
+
+@pytest.fixture()
+def user_project_permission_group(project, user_permission_group):
+    return UserPermissionGroupProjectPermission.objects.create(
+        group=user_permission_group, project=project
+    )
 
 
 @pytest.fixture(autouse=True)
 def task_processor_synchronously(settings):
     settings.TASK_RUN_METHOD = TaskRunMethod.SYNCHRONOUSLY
+
+
+@pytest.fixture()
+def a_metadata_field(organisation: Organisation) -> MetadataField:
+    return MetadataField.objects.create(name="a", type="int", organisation=organisation)
+
+
+@pytest.fixture()
+def b_metadata_field(organisation: Organisation) -> MetadataField:
+    return MetadataField.objects.create(name="b", type="str", organisation=organisation)
+
+
+@pytest.fixture()
+def required_a_environment_metadata_field(
+    organisation: Organisation,
+    a_metadata_field: MetadataField,
+    environment: Environment,
+    project: Project,
+    project_content_type: ContentType,
+) -> MetadataModelField:
+    environment_type = ContentType.objects.get_for_model(environment)
+    model_field = MetadataModelField.objects.create(
+        field=a_metadata_field,
+        content_type=environment_type,
+    )
+
+    MetadataModelFieldRequirement.objects.create(
+        content_type=project_content_type, object_id=project.id, model_field=model_field
+    )
+    return model_field
+
+
+@pytest.fixture()
+def required_a_feature_metadata_field(
+    organisation: Organisation,
+    a_metadata_field: MetadataField,
+    feature_content_type: ContentType,
+    project: Project,
+    project_content_type: ContentType,
+) -> MetadataModelField:
+    model_field = MetadataModelField.objects.create(
+        field=a_metadata_field,
+        content_type=feature_content_type,
+    )
+
+    MetadataModelFieldRequirement.objects.create(
+        content_type=project_content_type, object_id=project.id, model_field=model_field
+    )
+
+    return model_field
+
+
+@pytest.fixture()
+def required_a_feature_metadata_field_using_organisation_content_type(
+    organisation: Organisation,
+    a_metadata_field: MetadataField,
+    feature_content_type: ContentType,
+    project: Project,
+    organisation_content_type: ContentType,
+) -> MetadataModelField:
+    model_field = MetadataModelField.objects.create(
+        field=a_metadata_field,
+        content_type=feature_content_type,
+    )
+
+    MetadataModelFieldRequirement.objects.create(
+        content_type=organisation_content_type,
+        object_id=organisation.id,
+        model_field=model_field,
+    )
+
+    return model_field
+
+
+@pytest.fixture()
+def required_a_segment_metadata_field(
+    organisation: Organisation,
+    a_metadata_field: MetadataField,
+    segment_content_type: ContentType,
+    project: Project,
+    project_content_type: ContentType,
+) -> MetadataModelField:
+    model_field = MetadataModelField.objects.create(
+        field=a_metadata_field,
+        content_type=segment_content_type,
+    )
+
+    MetadataModelFieldRequirement.objects.create(
+        content_type=project_content_type, object_id=project.id, model_field=model_field
+    )
+
+    return model_field
+
+
+@pytest.fixture()
+def required_a_segment_metadata_field_using_organisation_content_type(
+    organisation: Organisation,
+    a_metadata_field: MetadataField,
+    segment_content_type: ContentType,
+    project: Project,
+    organisation_content_type: ContentType,
+) -> MetadataModelField:
+    model_field = MetadataModelField.objects.create(
+        field=a_metadata_field,
+        content_type=segment_content_type,
+    )
+
+    MetadataModelFieldRequirement.objects.create(
+        content_type=organisation_content_type,
+        object_id=organisation.id,
+        model_field=model_field,
+    )
+
+    return model_field
+
+
+@pytest.fixture()
+def optional_b_feature_metadata_field(
+    organisation: Organisation, b_metadata_field: MetadataField, feature: Feature
+) -> MetadataModelField:
+    feature_type = ContentType.objects.get_for_model(feature)
+
+    return MetadataModelField.objects.create(
+        field=b_metadata_field,
+        content_type=feature_type,
+    )
+
+
+@pytest.fixture()
+def optional_b_segment_metadata_field(
+    organisation: Organisation, b_metadata_field: MetadataField, segment: Segment
+) -> MetadataModelField:
+    segment_type = ContentType.objects.get_for_model(segment)
+
+    return MetadataModelField.objects.create(
+        field=b_metadata_field,
+        content_type=segment_type,
+    )
+
+
+@pytest.fixture()
+def optional_b_environment_metadata_field(
+    organisation: Organisation,
+    b_metadata_field: MetadataField,
+    environment: Environment,
+) -> MetadataModelField:
+    environment_type = ContentType.objects.get_for_model(environment)
+
+    return MetadataModelField.objects.create(
+        field=b_metadata_field,
+        content_type=environment_type,
+    )
+
+
+@pytest.fixture()
+def environment_metadata_a(
+    environment: Environment,
+    required_a_environment_metadata_field: MetadataModelField,
+) -> Metadata:
+    environment_type = ContentType.objects.get_for_model(environment)
+    return Metadata.objects.create(
+        object_id=environment.id,
+        content_type=environment_type,
+        model_field=required_a_environment_metadata_field,
+        field_value="10",
+    )
+
+
+@pytest.fixture()
+def environment_metadata_b(
+    environment: Environment,
+    optional_b_environment_metadata_field: MetadataModelField,
+) -> Metadata:
+    environment_type = ContentType.objects.get_for_model(environment)
+    return Metadata.objects.create(
+        object_id=environment.id,
+        content_type=environment_type,
+        model_field=optional_b_environment_metadata_field,
+        field_value="10",
+    )
+
+
+@pytest.fixture()
+def environment_content_type() -> ContentType:
+    return ContentType.objects.get_for_model(Environment)
+
+
+@pytest.fixture()
+def feature_content_type() -> ContentType:
+    return ContentType.objects.get_for_model(Feature)
+
+
+@pytest.fixture()
+def segment_content_type() -> ContentType:
+    return ContentType.objects.get_for_model(Segment)
+
+
+@pytest.fixture()
+def project_content_type() -> ContentType:
+    return ContentType.objects.get_for_model(Project)
+
+
+@pytest.fixture()
+def organisation_content_type() -> ContentType:
+    return ContentType.objects.get_for_model(Organisation)
+
+
+@pytest.fixture
+def manage_user_group_permission(db):
+    return OrganisationPermissionModel.objects.get(key=MANAGE_USER_GROUPS)
+
+
+@pytest.fixture()
+def aws_credentials():
+    """Mocked AWS Credentials for moto."""
+    os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+    os.environ["AWS_SECURITY_TOKEN"] = "testing"
+    os.environ["AWS_SESSION_TOKEN"] = "testing"
+    os.environ["AWS_DEFAULT_REGION"] = "eu-west-2"
+
+
+@pytest.fixture()
+def dynamodb(aws_credentials):
+    # TODO: move all wrapper tests to using moto
+    with mock_dynamodb():
+        yield boto3.resource("dynamodb")
+
+
+@pytest.fixture()
+def flagsmith_identities_table(
+    dynamodb: DynamoDBServiceResource, settings: SettingsWrapper
+) -> Table:
+    table = dynamodb.create_table(
+        TableName="flagsmith_identities",
+        KeySchema=[
+            {
+                "AttributeName": "composite_key",
+                "KeyType": "HASH",
+            },
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "composite_key", "AttributeType": "S"},
+            {"AttributeName": "environment_api_key", "AttributeType": "S"},
+            {"AttributeName": "identifier", "AttributeType": "S"},
+            {"AttributeName": "identity_uuid", "AttributeType": "S"},
+            {"AttributeName": "dashboard_alias", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "environment_api_key-identifier-index",
+                "KeySchema": [
+                    {"AttributeName": "environment_api_key", "KeyType": "HASH"},
+                    {"AttributeName": "identifier", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "identity_uuid-index",
+                "KeySchema": [{"AttributeName": "identity_uuid", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "environment_api_key-dashboard_alias-index-v2",
+                "KeySchema": [
+                    {"AttributeName": "environment_api_key", "KeyType": "HASH"},
+                    {"AttributeName": "dashboard_alias", "KeyType": "RANGE"},
+                ],
+                "Projection": {
+                    "ProjectionType": "INCLUDE",
+                    "NonKeyAttributes": [
+                        "identifier",
+                    ],
+                },
+            },
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    settings.IDENTITIES_TABLE_NAME_DYNAMO = table.name
+    return table
+
+
+@pytest.fixture()
+def flagsmith_environments_v2_table(dynamodb: DynamoDBServiceResource) -> Table:
+    return dynamodb.create_table(
+        TableName="flagsmith_environments_v2",
+        KeySchema=[
+            {
+                "AttributeName": "environment_id",
+                "KeyType": "HASH",
+            },
+            {
+                "AttributeName": "document_key",
+                "KeyType": "RANGE",
+            },
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "environment_id", "AttributeType": "S"},
+            {"AttributeName": "document_key", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+
+@pytest.fixture()
+def mock_github_client_generate_token(mocker: MockerFixture) -> MagicMock:
+    return mocker.patch(
+        "integrations.github.client.generate_token",
+        return_value="mocked_token",
+    )
+
+
+@pytest.fixture()
+def feature_external_resource(
+    feature: Feature,
+    post_request_mock: MagicMock,
+    mocker: MockerFixture,
+    mock_github_client_generate_token: MagicMock,
+) -> FeatureExternalResource:
+    return FeatureExternalResource.objects.create(
+        url="https://github.com/repositoryownertest/repositorynametest/issues/11",
+        type="GITHUB_ISSUE",
+        feature=feature,
+        metadata='{"status": "open"}',
+    )
+
+
+@pytest.fixture()
+def feature_external_resource_gh_pr(
+    feature: Feature,
+    post_request_mock: MagicMock,
+    mocker: MockerFixture,
+    mock_github_client_generate_token: MagicMock,
+) -> FeatureExternalResource:
+    return FeatureExternalResource.objects.create(
+        url="https://github.com/repositoryownertest/repositorynametest/pull/1",
+        type="GITHUB_PR",
+        feature=feature,
+        metadata='{"status": "open"}',
+    )
+
+
+@pytest.fixture()
+def feature_with_value_external_resource(
+    feature_with_value: Feature,
+    post_request_mock: MagicMock,
+    mock_github_client_generate_token: MagicMock,
+) -> FeatureExternalResource:
+    return FeatureExternalResource.objects.create(
+        url="https://github.com/repositoryownertest/repositorynametest/issues/11",
+        type="GITHUB_ISSUE",
+        feature=feature_with_value,
+    )
+
+
+@pytest.fixture()
+def github_configuration(organisation: Organisation) -> GithubConfiguration:
+    return GithubConfiguration.objects.create(
+        organisation=organisation, installation_id=1234567
+    )
+
+
+@pytest.fixture()
+def github_repository(
+    github_configuration: GithubConfiguration,
+    project: Project,
+) -> GitHubRepository:
+    return GitHubRepository.objects.create(
+        github_configuration=github_configuration,
+        repository_owner="repositoryownertest",
+        repository_name="repositorynametest",
+        project=project,
+        tagging_enabled=True,
+    )
+
+
+@pytest.fixture(
+    params=[
+        "admin_client_original",
+        "admin_master_api_key_client",
+    ]
+)
+def admin_client_new(
+    request: pytest.FixtureRequest,
+    admin_client_original: APIClient,
+    admin_master_api_key_client: APIClient,
+) -> APIClient:
+    if request.param == "admin_client_original":
+        yield admin_client_original
+    elif request.param == "admin_master_api_key_client":
+        yield admin_master_api_key_client
+    else:
+        assert False, "Request param mismatch"
+
+
+@pytest.fixture()
+def superuser():
+    return FFAdminUser.objects.create_superuser(
+        email="superuser@example.com",
+        password=FFAdminUser.objects.make_random_password(),
+    )
+
+
+@pytest.fixture()
+def superuser_client(superuser: FFAdminUser, client: APIClient):
+    client.force_login(superuser, backend="django.contrib.auth.backends.ModelBackend")
+    return client
+
+
+@pytest.fixture
+def inspecting_handler() -> logging.Handler:
+    """
+    Fixture used to test the output of logger related output.
+    """
+
+    class InspectingHandler(logging.Handler):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.messages = []
+
+        def handle(self, record: logging.LogRecord) -> None:
+            self.messages.append(self.format(record))
+
+    return InspectingHandler()
+
+
+@pytest.fixture
+def set_github_webhook_secret() -> None:
+    from django.conf import settings
+
+    settings.GITHUB_WEBHOOK_SECRET = "secret-key"

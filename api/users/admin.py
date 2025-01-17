@@ -44,13 +44,13 @@ class CustomUserAdmin(UserAdmin):
         "is_staff",
         "is_active",
         "date_joined",
+        "uuid",
     )
 
     list_filter = (
         "is_staff",
         "is_active",
         "date_joined",
-        "organisations",
     )
 
     search_fields = (
@@ -58,6 +58,7 @@ class CustomUserAdmin(UserAdmin):
         "username",
         "first_name",
         "last_name",
+        "uuid",
     )
 
     inlines = [UserOrganisationInline]

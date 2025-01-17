@@ -1,123 +1,208 @@
 // import propTypes from 'prop-types';
-import React, { PureComponent } from 'react';
-import TheInput from 'material-ui-chip-input';
-import ValueEditor from './ValueEditor';
-import Constants from '../../common/constants';
-import VariationOptions from './mv/VariationOptions';
-import AddVariationButton from './mv/AddVariationButton';
+import React, { PureComponent } from 'react'
+import ValueEditor from './ValueEditor'
+import Constants from 'common/constants'
+import VariationOptions from './mv/VariationOptions'
+import AddVariationButton from './mv/AddVariationButton'
+import ErrorMessage from './ErrorMessage'
+import Tooltip from './Tooltip'
+import Icon from './Icon'
+import InputGroup from './base/forms/InputGroup'
+import WarningMessage from './WarningMessage'
+
+function isNegativeNumberString(str) {
+  if (typeof Utils.getTypedValue(str) !== 'number') {
+    return false
+  }
+  if (typeof str !== 'string') {
+    return false
+  }
+  const num = parseFloat(str)
+  return !isNaN(num) && num < 0
+}
 
 export default class Feature extends PureComponent {
-    static displayName = 'Feature';
+  static displayName = 'Feature'
 
-    removeVariation = (i) => {
-        const idToRemove = this.props.multivariate_options[i].id;
-
-        if (idToRemove) {
-            openConfirm('Please confirm', 'This will remove the variation on your feature for all environments, if you wish to turn it off just for this environment you can set the % value to 0.', () => {
-                this.props.removeVariation(i);
-            });
-        } else {
-            this.props.removeVariation(i);
-        }
+  constructor(props) {
+    super(props)
+    this.state = {
+      isNegativeNumberString: isNegativeNumberString(
+        props.environmentFlag?.feature_state_value,
+      ),
     }
+  }
+  removeVariation = (i) => {
+    const idToRemove = this.props.multivariate_options[i].id
 
-    render() {
-        const {
-            identity,
-            hide_from_client,
-            checked,
-            onCheckedChange,
-            isEdit,
-            environmentFlag,
-            readOnly,
-            projectFlag,
-            multivariate_options,
-            value,
-            environmentVariations,
-            onValueChange,
-        } = this.props;
-
-        const enabledString = isEdit ? 'Enabled' : 'Enabled by default';
-        const disabled = hide_from_client;
-        const controlValue = Utils.calculateControl(multivariate_options);
-        const valueString = identity ? 'User override' : !!multivariate_options && multivariate_options.length ? `Control Value - ${controlValue}%` : `Value (optional)${' - these can be set per environment'}`;
-
-        const showValue = !(!!identity && (multivariate_options && !!multivariate_options.length));
-        return (
-            <div>
-                <FormGroup className="mb-4 mr-3 ml-3">
-                    <div>
-                        <label>{enabledString || 'Enabled'}</label>
-                    </div>
-                    <Switch
-                      data-test="toggle-feature-button"
-                      defaultChecked={checked}
-                      disabled={disabled || readOnly}
-                      checked={!disabled && checked}
-                      onChange={onCheckedChange}
-                    />
-                </FormGroup>
-
-                {showValue && (
-                    <FormGroup className="mx-3 mb-4 mr-3">
-                        <InputGroup
-                          component={(
-                              <ValueEditor
-                                data-test="featureValue"
-                                name="featureValue" className="full-width"
-                                value={`${typeof value === 'undefined' || value === null ? '' : value}`}
-                                onChange={onValueChange}
-                                disabled={hide_from_client || readOnly}
-                                placeholder="e.g. 'big' "
-                              />
-                            )}
-                          tooltip={Constants.strings.REMOTE_CONFIG_DESCRIPTION}
-                          title={`${valueString}`}
-                        />
-                    </FormGroup>
-                ) }
-
-                {!!identity && (
-                    <div>
-                        <FormGroup className="mb-4 mx-3">
-                            <VariationOptions
-                              disabled
-                              select
-                              controlValue={environmentFlag.feature_state_value}
-                              variationOverrides={this.props.identityVariations}
-                              setVariations={this.props.onChangeIdentityVariations}
-                              updateVariation={() => {}}
-                              weightTitle="Override Weight %"
-                              projectFlag={projectFlag}
-                              multivariateOptions={projectFlag.multivariate_options}
-                              removeVariation={() => {}}
-                            />
-                        </FormGroup>
-                    </div>
-                )}
-                {!identity && (
-                    <div>
-                        <FormGroup className="ml-3 mb-4 mr-3">
-                            {(!!environmentVariations || !isEdit) && (
-                                <VariationOptions
-                                  disabled={!!identity || readOnly}
-                                  controlValue={controlValue}
-                                  variationOverrides={environmentVariations}
-                                  updateVariation={this.props.updateVariation}
-                                  weightTitle={isEdit ? 'Environment Weight %' : 'Default Weight %'}
-                                  multivariateOptions={multivariate_options}
-                                  removeVariation={this.removeVariation}
-                                />
-                            )}
-                        </FormGroup>
-                        {!this.props.hideAddVariation && Utils.renderWithPermission(this.props.canCreateFeature, Constants.projectPermissions('Create Feature'), (
-                            <AddVariationButton disabled={!this.props.canCreateFeature || readOnly} onClick={this.props.addVariation}/>
-
-                        ))}
-                    </div>
-
-                )}
-            </div>
-        );
+    if (idToRemove) {
+      openConfirm({
+        body: 'This will remove the variation on your feature for all environments, if you wish to turn it off just for this environment you can set the % value to 0.',
+        destructive: true,
+        onYes: () => {
+          this.props.removeVariation(i)
+        },
+        title: 'Delete variation',
+        yesText: 'Confirm',
+      })
+    } else {
+      this.props.removeVariation(i)
     }
+  }
+
+  render() {
+    const {
+      checked,
+      environmentFlag,
+      environmentVariations,
+      error,
+      identity,
+      isEdit,
+      multivariate_options,
+      onCheckedChange,
+      onValueChange,
+      projectFlag,
+      readOnly,
+      value,
+    } = this.props
+
+    const enabledString = isEdit ? 'Enabled' : 'Enabled by default'
+    const controlPercentage = Utils.calculateControl(multivariate_options)
+    const valueString = identity
+      ? 'User override'
+      : !!multivariate_options && multivariate_options.length
+      ? `Control Value - ${controlPercentage}%`
+      : `Value`
+
+    const showValue = !(
+      !!identity &&
+      multivariate_options &&
+      !!multivariate_options.length
+    )
+    return (
+      <div>
+        <FormGroup className='mb-4'>
+          <Tooltip
+            title={
+              <div className='flex-row'>
+                <Switch
+                  data-test='toggle-feature-button'
+                  defaultChecked={checked}
+                  disabled={readOnly}
+                  checked={checked}
+                  onChange={onCheckedChange}
+                  className='ml-0'
+                />
+                <div className='label-switch ml-3 mr-1'>
+                  {enabledString || 'Enabled'}
+                </div>
+                {!isEdit && <Icon name='info-outlined' />}
+              </div>
+            }
+          >
+            {!isEdit &&
+              'This will determine the initial enabled state for all environments. You can edit the this individually for each environment once the feature is created.'}
+          </Tooltip>
+        </FormGroup>
+
+        {showValue && (
+          <FormGroup className='mb-4'>
+            <InputGroup
+              component={
+                <ValueEditor
+                  data-test='featureValue'
+                  name='featureValue'
+                  className='full-width'
+                  value={`${
+                    typeof value === 'undefined' || value === null ? '' : value
+                  }`}
+                  onChange={onValueChange}
+                  disabled={readOnly}
+                  placeholder="e.g. 'big' "
+                />
+              }
+              tooltip={`${Constants.strings.REMOTE_CONFIG_DESCRIPTION}${
+                !isEdit
+                  ? '<br/>Setting this when creating a feature will set the value for all environments. You can edit this individually for each environment once the feature is created.'
+                  : ''
+              }`}
+              title={`${valueString}`}
+            />
+          </FormGroup>
+        )}
+        {this.state.isNegativeNumberString && (
+          <WarningMessage
+            warningMessage={
+              <div>
+                This feature currently has the value of{' '}
+                <strong>"{environmentFlag?.feature_state_value}"</strong>.
+                Saving this feature will convert its value from a string to a
+                number. If you wish to preserve this value as a string, please
+                save it using the{' '}
+                <a href='https://api.flagsmith.com/api/v1/docs/#/api/api_v1_environments_featurestates_update'>
+                  API
+                </a>
+                .
+              </div>
+            }
+          />
+        )}
+
+        {!!error && (
+          <div className='mx-2 mt-2'>
+            <ErrorMessage error={error} />
+          </div>
+        )}
+        {!!identity && (
+          <div>
+            <FormGroup className='mb-4'>
+              <VariationOptions
+                disabled
+                select
+                controlValue={environmentFlag?.feature_state_value}
+                controlPercentage={controlPercentage}
+                variationOverrides={this.props.identityVariations}
+                setVariations={this.props.onChangeIdentityVariations}
+                updateVariation={() => {}}
+                weightTitle='Override Weight %'
+                projectFlag={projectFlag}
+                multivariateOptions={projectFlag.multivariate_options}
+                removeVariation={() => {}}
+              />
+            </FormGroup>
+          </div>
+        )}
+        {!identity && (
+          <div>
+            <FormGroup className='mb-0'>
+              {(!!environmentVariations || !isEdit) && (
+                <VariationOptions
+                  disabled={!!identity || readOnly}
+                  controlValue={environmentFlag?.feature_state_value}
+                  controlPercentage={controlPercentage}
+                  variationOverrides={environmentVariations}
+                  updateVariation={this.props.updateVariation}
+                  weightTitle={
+                    isEdit ? 'Environment Weight %' : 'Default Weight %'
+                  }
+                  multivariateOptions={multivariate_options}
+                  removeVariation={this.removeVariation}
+                />
+              )}
+            </FormGroup>
+            {!this.props.hideAddVariation &&
+              Utils.renderWithPermission(
+                this.props.canCreateFeature,
+                Constants.projectPermissions('Create Feature'),
+                <AddVariationButton
+                  multivariateOptions={multivariate_options}
+                  disabled={!this.props.canCreateFeature || readOnly}
+                  onClick={this.props.addVariation}
+                />,
+              )}
+          </div>
+        )}
+      </div>
+    )
+  }
 }

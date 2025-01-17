@@ -1,5 +1,6 @@
 import typing
 
+from common.projects.permissions import VIEW_PROJECT
 from rest_framework.test import APIClient
 
 from environments.models import Environment
@@ -21,7 +22,7 @@ def get_environment_user_client(
     Update provided user with given permissions and return an authenticated client
     """
 
-    view_project_permission = ProjectPermissionModel.objects.get(key="VIEW_PROJECT")
+    view_project_permission = ProjectPermissionModel.objects.get(key=VIEW_PROJECT)
     user_project_permission = UserProjectPermission.objects.create(
         user=user, project=environment.project
     )

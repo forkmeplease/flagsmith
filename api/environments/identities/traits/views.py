@@ -1,9 +1,9 @@
+from common.environments.permissions import MANAGE_IDENTITIES, VIEW_IDENTITIES
 from django.conf import settings
 from django.core.exceptions import BadRequest
 from django.db.models import Q
-from django.utils.decorators import method_decorator
-from drf_yasg2 import openapi
-from drf_yasg2.utils import swagger_auto_schema
+from drf_yasg import openapi
+from drf_yasg.utils import swagger_auto_schema
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -22,10 +22,6 @@ from environments.identities.traits.serializers import (
     TraitSerializerBasic,
     TraitSerializerFull,
 )
-from environments.permissions.constants import (
-    MANAGE_IDENTITIES,
-    VIEW_IDENTITIES,
-)
 from environments.permissions.permissions import (
     EnvironmentKeyPermissions,
     NestedEnvironmentPermissions,
@@ -36,27 +32,9 @@ from environments.sdk.serializers import (
     SDKCreateUpdateTraitSerializer,
 )
 from environments.views import logger
-from sse import send_identity_update_messages
-from sse.decorators import generate_identity_update_message
 from util.views import SDKAPIView
 
-generate_identity_message_decorator_trait_view = generate_identity_update_message(
-    lambda req: (req.environment, req.identity.identifier)
-)
 
-
-@method_decorator(
-    generate_identity_message_decorator_trait_view,
-    name="create",
-)
-@method_decorator(
-    generate_identity_message_decorator_trait_view,
-    name="destroy",
-)
-@method_decorator(
-    generate_identity_message_decorator_trait_view,
-    name="update",
-)
 class TraitViewSet(viewsets.ModelViewSet):
     serializer_class = TraitSerializer
 
@@ -79,6 +57,9 @@ class TraitViewSet(viewsets.ModelViewSet):
         """
         Override queryset to filter based on the parent identity.
         """
+        if getattr(self, "swagger_fake_view", False):
+            return Trait.objects.none()
+
         return Trait.objects.filter(identity=self.identity)
 
     def get_permissions(self):
@@ -129,6 +110,7 @@ class SDKTraitsDeprecated(SDKAPIView):
     # API to handle /api/v1/identities/<identifier>/traits/<trait_key> endpoints
     # if Identity or Trait does not exist it will create one, otherwise will fetch existing
     serializer_class = TraitSerializerBasic
+    throttle_classes = []
 
     schema = None
 
@@ -194,16 +176,10 @@ class SDKTraitsDeprecated(SDKAPIView):
             )
 
 
-@method_decorator(generate_identity_update_message(), name="create")
-@method_decorator(
-    generate_identity_update_message(
-        lambda req: (req.environment, req.data["identifier"])
-    ),
-    name="increment_value",
-)
 class SDKTraits(mixins.CreateModelMixin, viewsets.GenericViewSet):
     permission_classes = (EnvironmentKeyPermissions, TraitPersistencePermissions)
     authentication_classes = (EnvironmentKeyAuthentication,)
+    throttle_classes = []
 
     def get_serializer_class(self):
         if self.action == "increment_value":
@@ -298,10 +274,6 @@ class SDKTraits(mixins.CreateModelMixin, viewsets.GenericViewSet):
                     )
                 )
 
-            send_identity_update_messages(
-                request.environment,
-                [trait["identity"]["identifier"] for trait in traits],
-            )
             return Response(serializer.data, status=200)
 
         except (TypeError, AttributeError) as excinfo:

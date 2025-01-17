@@ -5,13 +5,14 @@ from django.conf import settings
 from django.http import HttpResponse, JsonResponse
 from django.template import loader
 from django.views.decorators.csrf import csrf_exempt
+from rest_framework.request import Request
 
 from . import utils
 
 logger = logging.getLogger(__name__)
 
 
-def version_info(request):
+def version_info(request: Request) -> JsonResponse:
     return JsonResponse(utils.get_version_info())
 
 
@@ -24,10 +25,7 @@ def index(request):
         return HttpResponse(status=405, content_type="application/json")
 
     template = loader.get_template("webpack/index.html")
-    context = {
-        "linkedin_api_key": settings.LINKEDIN_API_KEY,
-    }
-    return HttpResponse(template.render(context, request))
+    return HttpResponse(template.render(request=request))
 
 
 def project_overrides(request):
@@ -39,21 +37,26 @@ def project_overrides(request):
         "amplitude": "AMPLITUDE_API_KEY",
         "api": "API_URL",
         "assetURL": "ASSET_URL",
+        "cookieAuthEnabled": "COOKIE_AUTH_ENABLED",
+        "cookieSameSite": "COOKIE_SAME_SITE",
         "crispChat": "CRISP_CHAT_API_KEY",
-        "disableInflux": "DISABLE_INFLUXDB_FEATURES",
+        "disableAnalytics": "DISABLE_ANALYTICS_FEATURES",
         "flagsmith": "FLAGSMITH_ON_FLAGSMITH_API_KEY",
         "flagsmithAnalytics": "FLAGSMITH_ANALYTICS",
-        "flagsmithRealtime": "ENABLE_FLAGSMITH_REALTIME",
         "flagsmithClientAPI": "FLAGSMITH_ON_FLAGSMITH_API_URL",
+        "flagsmithRealtime": "ENABLE_FLAGSMITH_REALTIME",
+        "fpr": "FIRST_PROMOTER_ID",
         "ga": "GOOGLE_ANALYTICS_API_KEY",
+        "githubAppURL": "GITHUB_APP_URL",
         "headway": "HEADWAY_API_KEY",
         "hideInviteLinks": "DISABLE_INVITE_LINKS",
-        "linkedin_api_key": "LINKEDIN_API_KEY",
+        "linkedinPartnerTracking": "LINKEDIN_PARTNER_TRACKING",
         "maintenance": "MAINTENANCE_MODE",
         "mixpanel": "MIXPANEL_API_KEY",
         "preventEmailPassword": "PREVENT_EMAIL_PASSWORD",
         "preventSignup": "PREVENT_SIGNUP",
         "sentry": "SENTRY_API_KEY",
+        "useSecureCookies": "USE_SECURE_COOKIES",
     }
 
     override_data = {

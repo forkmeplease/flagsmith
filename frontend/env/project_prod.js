@@ -1,19 +1,34 @@
-const globalThis = typeof window === 'undefined' ? global : window;
+import { E2E_CHANGE_MAIL, E2E_SIGN_UP_USER, E2E_USER } from '../e2e/config'
+
+const globalThis = typeof window === 'undefined' ? global : window
 module.exports = global.Project = {
-    api: 'https://api.flagsmith.com/api/v1/',
-    flagsmithClientAPI: 'https://api.flagsmith.com/api/v1/',
-    flagsmithClientEdgeAPI: 'https://edge.api.flagsmith.com/api/v1/',
-    flagsmith: '4vfqhypYjcPoGGu8ByrBaj', // This is our Bullet Train API key - Bullet Train runs on Bullet Train!
-    env: 'prod', // This is used for Sentry tracking
-    maintenance: false, // trigger maintenance mode
-    cookieDomain: '.flagsmith.com',
-    excludeAnalytics: 'nightwatch@solidstategroup.com',
-    demoAccount: {
-        email: 'kyle+bullet-train@solidstategroup.com',
-        password: 'demo_account',
-    },
-    chargebee: {
-        site: 'flagsmith',
-    },
-    ...(globalThis.projectOverrides || {}),
-};
+  api: 'https://api.flagsmith.com/api/v1/',
+
+  chargebee: {
+    site: 'flagsmith',
+  },
+
+  cookieDomain: '.flagsmith.com',
+
+  env: 'prod',
+
+  excludeAnalytics: [E2E_SIGN_UP_USER, E2E_USER, E2E_CHANGE_MAIL],
+
+  // This is our Bullet Train API key - Bullet Train runs on Bullet Train!
+  flagsmith: '4vfqhypYjcPoGGu8ByrBaj',
+
+  flagsmithClientAPI: 'https://api.flagsmith.com/api/v1/',
+
+  flagsmithClientEdgeAPI: 'https://edge.api.flagsmith.com/api/v1/',
+
+  hubspot: '//js-eu1.hs-scripts.com/143451822.js',
+  // This is used for Sentry tracking
+  maintenance: false,
+  linkedinConversionId: 16798338,
+  plans: {
+    scaleUp: { annual: 'scale-up-12-months-v2', monthly: 'scale-up-v2' },
+    startup: { annual: 'start-up-12-months-v2', monthly: 'startup-v2' },
+  },
+  useSecureCookies: true,
+  ...(globalThis.projectOverrides || {}),
+}

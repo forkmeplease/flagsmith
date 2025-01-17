@@ -6,9 +6,11 @@ from core.apps import BaseAppConfig
 
 class FeaturesConfig(BaseAppConfig):
     name = "features"
+    default = True
 
     def ready(self):
         super().ready()
 
         # noinspection PyUnresolvedReferences
         import features.signals  # noqa
+        import features.tasks  # noqa

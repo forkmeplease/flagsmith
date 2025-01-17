@@ -5,8 +5,14 @@ from django.db.models.signals import post_migrate, post_save
 from django.dispatch import receiver
 from django.urls import reverse
 
+from integrations.lead_tracking.pipedrive.lead_tracker import (
+    PipedriveLeadTracker,
+)
 from users.models import FFAdminUser
-from users.tasks import create_pipedrive_lead
+from users.tasks import (
+    create_pipedrive_lead,
+    send_email_changed_notification_email,
+)
 
 
 @receiver(post_migrate, sender=FFAdminUser)
@@ -22,15 +28,24 @@ def warn_insecure(sender, **kwargs):
 
 @receiver(post_save, sender=FFAdminUser)
 def create_pipedrive_lead_signal(sender, instance, created, **kwargs):
-    if (
-        not (
-            created
-            and (
-                settings.PIPEDRIVE_API_TOKEN or settings.ENABLE_PIPEDRIVE_LEAD_TRACKING
-            )
-        )
-        or instance.email_domain in settings.PIPEDRIVE_IGNORE_DOMAINS
-    ):
+    user: FFAdminUser = instance
+
+    if not created:
+        return False
+
+    if not PipedriveLeadTracker.should_track(user):
         return
 
-    create_pipedrive_lead.delay(args=(instance.id,))
+    create_pipedrive_lead.delay(args=(user.id,))
+
+
+@receiver(post_save, sender=FFAdminUser)
+def send_warning_email(sender, instance, created, **kwargs):
+    if instance._initial_state and (instance._initial_state["email"] != instance.email):
+        send_email_changed_notification_email.delay(
+            args=(
+                instance.first_name,
+                settings.DEFAULT_FROM_EMAIL,
+                instance._initial_state["email"],
+            )
+        )

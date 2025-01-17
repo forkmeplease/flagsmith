@@ -1,70 +1,91 @@
-import React, { FunctionComponent } from 'react';
-import ValueEditor from '../ValueEditor'; // we need this to make JSX compile
-
+import React from 'react'
+import ValueEditor from 'components/ValueEditor' // we need this to make JSX compile
+import Constants from 'common/constants'
+import Icon from 'components/Icon'
+import shallowEqual from 'fbjs/lib/shallowEqual'
 
 const VariationValue = ({
-    value,
-    onChange,
-    weightTitle,
-    onRemove,
-    index,
-    disabled,
+  disabled,
+  index,
+  onChange,
+  onRemove,
+  readOnlyValue,
+  value,
+  weightTitle,
 }) => (
-    <div className="panel panel--flat panel-without-heading mb-2">
-        <div className="panel-content">
-            <Row>
-                <div className="flex flex-1">
-                    <InputGroup
-                      component={(
-                          <ValueEditor
-                            data-test={`featureVariationValue${index}`}
-                            name="featureValue" className="full-width"
-                            value={Utils.getTypedValue(Utils.featureStateToValue(value))}
-                            disabled={disabled}
-                            onChange={(e) => {
-                                onChange({
-                                    ...value,
-                                    ...Utils.valueToFeatureState(Utils.safeParseEventValue(e)),
-                                });
-                            }}
-                            placeholder="e.g. 'big' "
-                          />
-)}
-                      tooltip={Constants.strings.REMOTE_CONFIG_DESCRIPTION_VARIATION}
-                      title="Value"
-                    />
-                </div>
-                <div className="ml-2" style={{ width: 210 }}>
-                    <InputGroup
-                      type="text"
-                      data-test={`featureVariationWeight${Utils.featureStateToValue(value)}`}
-                      onChange={(e) => {
-                          onChange({
-                              ...value,
-                              default_percentage_allocation: Utils.safeParseEventValue(e) ? parseInt(Utils.safeParseEventValue(e)) : null,
-                          });
-                      }}
-                      value={value.default_percentage_allocation}
-                      inputProps={{ style: { marginTop: 2 }, maxLength: 3, readOnly: disabled }}
-                      title={weightTitle}
-                    />
-                </div>
-                {!!onRemove && (
-                <div className="ml-2" style={{ width: 30, marginTop: 22 }}>
-                    <button
-                      onClick={onRemove}
-                      id="delete-multivariate"
-                      type="button"
-                      className="btn btn--with-icon ml-auto btn--remove"
-                    >
-                        <RemoveIcon/>
-                    </button>
-                </div>
-                )}
-
-            </Row>
-        </div>
+  <Row className='align-items-start mb-2'>
+    <div className='flex flex-1 overflow-hidden'>
+      <InputGroup
+        noMargin
+        component={
+          <ValueEditor
+            data-test={`featureVariationValue${
+              Utils.featureStateToValue(value) || index
+            }`}
+            name='featureValue'
+            className='full-width code-medium'
+            value={Utils.getTypedValue(Utils.featureStateToValue(value))}
+            disabled={disabled || readOnlyValue}
+            onBlur={() => {
+              const newValue = {
+                ...value,
+                // Trim spaces and do conversion on blur
+                ...Utils.valueToFeatureState(Utils.featureStateToValue(value)),
+              }
+              if (!shallowEqual(newValue, value)) {
+                //occurs if we converted a trimmed value
+                onChange(newValue)
+              }
+            }}
+            onChange={(e) => {
+              onChange({
+                ...value,
+                ...Utils.valueToFeatureState(
+                  Utils.safeParseEventValue(e),
+                  false,
+                ),
+              })
+            }}
+            placeholder="e.g. 'big' "
+          />
+        }
+        tooltip={Constants.strings.REMOTE_CONFIG_DESCRIPTION_VARIATION}
+        title='Variation Value'
+      />
     </div>
-);
+    <div className='ml-3' style={{ width: 160 }}>
+      <InputGroup
+        type='text'
+        data-test={`featureVariationWeight${Utils.featureStateToValue(value)}`}
+        onChange={(e) => {
+          onChange({
+            ...value,
+            default_percentage_allocation: Utils.safeParseEventValue(e)
+              ? parseInt(Utils.safeParseEventValue(e))
+              : null,
+          })
+        }}
+        value={value.default_percentage_allocation}
+        inputProps={{
+          maxLength: 3,
+          readOnly: disabled,
+        }}
+        title={weightTitle}
+      />
+    </div>
+    {!!onRemove && (
+      <div style={{ position: 'relative', top: '27px' }} className='ml-2'>
+        <button
+          onClick={onRemove}
+          id='delete-multivariate'
+          type='button'
+          className='btn btn-with-icon'
+        >
+          <Icon name='trash-2' width={20} fill={'#656D7B'} />
+        </button>
+      </div>
+    )}
+  </Row>
+)
 
-export default VariationValue;
+export default VariationValue

@@ -2,12 +2,15 @@ import typing
 
 import requests
 
+from integrations.lead_tracking.pipedrive.constants import MarketingStatus
 from integrations.lead_tracking.pipedrive.exceptions import PipedriveAPIError
 from integrations.lead_tracking.pipedrive.models import (
     PipedriveDealField,
     PipedriveLead,
+    PipedriveLeadLabel,
     PipedriveOrganization,
     PipedriveOrganizationField,
+    PipedrivePerson,
 )
 
 
@@ -39,11 +42,22 @@ class PipedriveAPIClient:
         api_response_data = self._make_request(
             resource="organizations/search",
             http_method="get",
-            query_params={"term": search_term},
+            query_params={"term": search_term, "fields": "custom_fields"},
         )
         return [
             PipedriveOrganization.from_response_data(org["item"])
             for org in api_response_data["items"]
+        ]
+
+    def search_persons(self, search_term: str) -> typing.List[PipedrivePerson]:
+        api_response_data = self._make_request(
+            resource="persons/search",
+            http_method="get",
+            query_params={"term": search_term},
+        )
+        return [
+            PipedrivePerson.from_response_data(person["item"])
+            for person in api_response_data["items"]
         ]
 
     def create_organization_field(
@@ -72,19 +86,48 @@ class PipedriveAPIClient:
         self,
         title: str,
         organization_id: int,
+        person_id: int = None,
         custom_fields: typing.Dict[str, typing.Any] = None,
+        label_ids: typing.List[str] = None,
     ) -> PipedriveLead:
+        data = {
+            "title": title,
+            "organization_id": organization_id,
+            "label_ids": label_ids or [],
+            **(custom_fields or {}),
+        }
+        if person_id:
+            data["person_id"] = person_id
+
         api_response_data = self._make_request(
-            resource="leads",
+            resource="leads", http_method="post", data=data, expected_status_code=201
+        )
+        return PipedriveLead.from_response_data(api_response_data)
+
+    def create_person(
+        self, name: str, email: str, marketing_status: str = MarketingStatus.NO_CONSENT
+    ) -> PipedrivePerson:
+        api_response_data = self._make_request(
+            resource="persons",
             http_method="post",
             data={
-                "title": title,
-                "organization_id": organization_id,
-                **(custom_fields or {}),
+                "name": name,
+                "email": email,
+                "marketing_status": marketing_status,
             },
             expected_status_code=201,
         )
-        return PipedriveLead.from_response_data(api_response_data)
+        return PipedrivePerson.from_response_data(api_response_data)
+
+    def list_lead_labels(self) -> typing.List[PipedriveLeadLabel]:
+        api_response_data = self._make_request(
+            resource="leadLabels",
+            http_method="get",
+            expected_status_code=200,
+        )
+        return [
+            PipedriveLeadLabel.from_response_data(label) for label in api_response_data
+        ]
 
     def _make_request(
         self,

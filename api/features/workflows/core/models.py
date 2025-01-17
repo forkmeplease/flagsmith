@@ -1,8 +1,11 @@
+import importlib
 import logging
 import typing
+from datetime import datetime
 
 from core.helpers import get_current_site_url
 from core.models import (
+    AbstractBaseExportableModel,
     SoftDeleteExportableModel,
     abstract_base_auditable_model_factory,
 )
@@ -15,6 +18,8 @@ from django_lifecycle import (
     AFTER_CREATE,
     AFTER_SAVE,
     AFTER_UPDATE,
+    BEFORE_CREATE,
+    BEFORE_DELETE,
     LifecycleModel,
     LifecycleModelMixin,
     hook,
@@ -24,13 +29,21 @@ from audit.constants import (
     CHANGE_REQUEST_APPROVED_MESSAGE,
     CHANGE_REQUEST_COMMITTED_MESSAGE,
     CHANGE_REQUEST_CREATED_MESSAGE,
+    CHANGE_REQUEST_DELETED_MESSAGE,
 )
 from audit.related_object_type import RelatedObjectType
-from audit.tasks import create_feature_state_went_live_audit_log
+from audit.tasks import (
+    create_feature_state_updated_by_change_request_audit_log,
+    create_feature_state_went_live_audit_log,
+)
+from environments.tasks import rebuild_environment_document
 from features.models import FeatureState
-
-from .exceptions import (
+from features.versioning.models import EnvironmentFeatureVersion
+from features.versioning.signals import environment_feature_version_published
+from features.versioning.tasks import trigger_update_version_webhooks
+from features.workflows.core.exceptions import (
     CannotApproveOwnChangeRequest,
+    ChangeRequestDeletionError,
     ChangeRequestNotApprovedError,
 )
 
@@ -55,19 +68,30 @@ class ChangeRequest(
 
     title = models.CharField(max_length=500)
     description = models.TextField(blank=True, null=True)
+
+    # We allow null here so that deleting users does not cascade to deleting change
+    # requests which can be used for historical purposes.
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="change_requests",
+        null=True,
+    )
+
+    project = models.ForeignKey(
+        "projects.Project",
         on_delete=models.CASCADE,
         related_name="change_requests",
+        null=False,
     )
 
     environment = models.ForeignKey(
         "environments.Environment",
         on_delete=models.CASCADE,
         related_name="change_requests",
+        null=True,
     )
 
-    deleted_at = models.DateTimeField(null=True)
     committed_at = models.DateTimeField(null=True)
     committed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -75,6 +99,12 @@ class ChangeRequest(
         related_name="committed_change_requests",
         null=True,
     )
+
+    ignore_conflicts = models.BooleanField(default=False)
+
+    class Meta:
+        # Explicit ordering to prevent pagination warnings.
+        ordering = ("id",)
 
     def approve(self, user: "FFAdminUser"):
         if user.id == self.user_id:
@@ -94,29 +124,106 @@ class ChangeRequest(
 
         logger.debug("Committing change request #%d", self.id)
 
-        feature_states = list(self.feature_states.all())
-
-        for feature_state in feature_states:
-            if not feature_state.live_from:
-                feature_state.live_from = timezone.now()
-
-            feature_state.version = FeatureState.get_next_version_number(
-                environment_id=feature_state.environment_id,
-                feature_id=feature_state.feature_id,
-                feature_segment_id=feature_state.feature_segment_id,
-                identity_id=feature_state.identity_id,
-            )
-
-        FeatureState.objects.bulk_update(
-            feature_states, fields=["live_from", "version"]
-        )
+        self._publish_feature_states()
+        self._publish_environment_feature_versions(committed_by)
+        self._publish_change_sets(committed_by)
+        self._publish_segments()
 
         self.committed_at = timezone.now()
         self.committed_by = committed_by
         self.save()
 
+    def _publish_feature_states(self) -> None:
+        now = timezone.now()
+
+        if feature_states := list(self.feature_states.all()):
+            for feature_state in feature_states:
+                if not feature_state.live_from or feature_state.live_from < now:
+                    feature_state.live_from = now
+
+                feature_state.version = FeatureState.get_next_version_number(
+                    environment_id=feature_state.environment_id,
+                    feature_id=feature_state.feature_id,
+                    feature_segment_id=feature_state.feature_segment_id,
+                    identity_id=feature_state.identity_id,
+                )
+
+            FeatureState.objects.bulk_update(
+                feature_states, fields=["live_from", "version"]
+            )
+
+    def _publish_environment_feature_versions(
+        self, published_by: "FFAdminUser"
+    ) -> None:
+        now = timezone.now()
+
+        if environment_feature_versions := list(
+            self.environment_feature_versions.all()
+        ):
+            for environment_feature_version in environment_feature_versions:
+                if (
+                    not environment_feature_version.live_from
+                    or environment_feature_version.live_from < now
+                ):
+                    environment_feature_version.live_from = now
+
+                environment_feature_version.publish(published_by, persist=False)
+
+            EnvironmentFeatureVersion.objects.bulk_update(
+                environment_feature_versions,
+                fields=["published_at", "published_by", "live_from"],
+            )
+
+            for environment_feature_version in environment_feature_versions:
+                trigger_update_version_webhooks.delay(
+                    kwargs={
+                        "environment_feature_version_uuid": str(
+                            environment_feature_version.uuid
+                        )
+                    },
+                    delay_until=environment_feature_version.live_from,
+                )
+                rebuild_environment_document.delay(
+                    kwargs={"environment_id": self.environment_id},
+                    delay_until=environment_feature_version.live_from,
+                )
+                environment_feature_version_published.send(
+                    EnvironmentFeatureVersion, instance=environment_feature_version
+                )
+
+    def _publish_change_sets(self, published_by: "FFAdminUser") -> None:
+        for change_set in self.change_sets.all():
+            change_set.publish(user=published_by)
+
+    def _publish_segments(self) -> None:
+        for segment in self.segments.all():
+            target_segment = segment.version_of
+            assert target_segment != segment
+
+            # Deep clone the segment to establish historical version this is required
+            # because the target segment will be altered when the segment is published.
+            # Think of it like a regular update to a segment where we create the clone
+            # to create the version, then modifying the new 'draft' version with the
+            # data from the change request.
+            target_segment.deep_clone()
+
+            # Set the properties of the change request's segment to the properties
+            # of the target (i.e., canonical) segment.
+            target_segment.name = segment.name
+            target_segment.description = segment.description
+            target_segment.feature = segment.feature
+            target_segment.save()
+
+            # Delete the rules in order to replace them with copies of the segment.
+            target_segment.rules.all().delete()
+            for rule in segment.rules.all():
+                rule.deep_clone(target_segment)
+
     def get_create_log_message(self, history_instance) -> typing.Optional[str]:
         return CHANGE_REQUEST_CREATED_MESSAGE % self.title
+
+    def get_delete_log_message(self, history_instance) -> typing.Optional[str]:
+        return CHANGE_REQUEST_DELETED_MESSAGE % self.title
 
     def get_update_log_message(self, history_instance) -> typing.Optional[str]:
         if (
@@ -139,10 +246,21 @@ class ChangeRequest(
     def _get_environment(self) -> typing.Optional["Environment"]:
         return self.environment
 
-    def _get_project(self) -> typing.Optional["Project"]:
-        return self.environment.project
+    def _get_project(self) -> "Project":
+        return self.project
 
     def is_approved(self):
+        if self.environment:
+            return self.is_approved_via_environment()
+        return self.is_approved_via_project()
+
+    def is_approved_via_project(self):
+        return self.project.minimum_change_request_approvals is None or (
+            self.approvals.filter(approved_at__isnull=False).count()
+            >= self.project.minimum_change_request_approvals
+        )
+
+    def is_approved_via_environment(self):
         return self.environment.minimum_change_request_approvals is None or (
             self.approvals.filter(approved_at__isnull=False).count()
             >= self.environment.minimum_change_request_approvals
@@ -159,8 +277,11 @@ class ChangeRequest(
                 "Change request must be saved before it has a url attribute."
             )
         url = get_current_site_url()
-        url += f"/project/{self.environment.project.id}"
-        url += f"/environment/{self.environment.api_key}"
+        if self.environment:
+            url += f"/project/{self.environment.project_id}"
+            url += f"/environment/{self.environment.api_key}"
+        else:
+            url += f"/project/{self.project_id}"
         url += f"/change-requests/{self.id}"
         return url
 
@@ -168,17 +289,58 @@ class ChangeRequest(
     def email_subject(self):
         return f"Flagsmith Change Request: {self.title} (#{self.id})"
 
+    @hook(BEFORE_CREATE, when="project", is_now=None)
+    def set_project_from_environment(self):
+        self.project_id = self.environment.project_id
+
     @hook(AFTER_CREATE, when="committed_at", is_not=None)
     @hook(AFTER_SAVE, when="committed_at", was=None, is_not=None)
-    def schedule_audit_log_creation_task_for_feature_state_going_live(self):
-        now = timezone.now()
-        feature_states = list(
-            self.feature_states.filter(live_from__gt=now).order_by("live_from")
-        )
-        for feature_state in feature_states:
-            create_feature_state_went_live_audit_log.delay(
-                delay_until=feature_state.live_from, args=(feature_state.id,)
+    def create_audit_log_for_related_feature_state(self):
+        for feature_state in self.feature_states.all():
+            if self.committed_at < feature_state.live_from:
+                create_feature_state_went_live_audit_log.delay(
+                    delay_until=feature_state.live_from, args=(feature_state.id,)
+                )
+            else:
+                create_feature_state_updated_by_change_request_audit_log.delay(
+                    args=(feature_state.id,)
+                )
+
+    @hook(BEFORE_DELETE)
+    def prevent_change_request_delete_if_committed(self) -> None:
+        # In the workflows-logic module, we prevent change requests from being
+        # deleted but, since this can have unexpected effects on published
+        # feature states, we also want to prevent it at the ORM level.
+        if self.committed_at and not (
+            self.environment.deleted_at
+            or (self.live_from and self.live_from > timezone.now())
+        ):
+            raise ChangeRequestDeletionError(
+                "Cannot delete a Change Request that has been committed."
             )
+
+    @property
+    def live_from(self) -> datetime | None:
+        # Note: a change request can only have one of either
+        # feature_states, change_sets or environment_feature_versions
+
+        # First we check if there are feature states associated with the change request
+        # and, if so, we return the live_from of the feature state with the earliest
+        # live_from.
+        if first_feature_state := self.feature_states.order_by("live_from").first():
+            return first_feature_state.live_from
+
+        # Then we check the change sets.
+        elif first_change_set := self.change_sets.order_by("live_from").first():
+            return first_change_set.live_from
+
+        # Finally, we do the same for environment feature versions.
+        elif first_environment_feature_version := self.environment_feature_versions.order_by(
+            "live_from"
+        ).first():
+            return first_environment_feature_version.live_from
+
+        return None
 
 
 class ChangeRequestApproval(LifecycleModel, abstract_base_auditable_model_factory()):
@@ -215,6 +377,7 @@ class ChangeRequestApproval(LifecycleModel, abstract_base_auditable_model_factor
             html_message=render_to_string(
                 "workflows_core/change_request_assignee_notification.html", context
             ),
+            fail_silently=True,
         )
 
     @hook(AFTER_CREATE, when="approved_at", is_not=None)
@@ -238,6 +401,7 @@ class ChangeRequestApproval(LifecycleModel, abstract_base_auditable_model_factor
                 "workflows_core/change_request_approved_author_notification.html",
                 context,
             ),
+            fail_silently=True,
         )
 
     def get_create_log_message(self, history_instance) -> typing.Optional[str]:
@@ -259,3 +423,21 @@ class ChangeRequestApproval(LifecycleModel, abstract_base_auditable_model_factor
 
     def _get_environment(self):
         return self.change_request.environment
+
+    def _get_project(self):
+        return self.change_request._get_project()
+
+
+class ChangeRequestGroupAssignment(AbstractBaseExportableModel, LifecycleModel):
+    change_request = models.ForeignKey(
+        ChangeRequest, on_delete=models.CASCADE, related_name="group_assignments"
+    )
+    group = models.ForeignKey("users.UserPermissionGroup", on_delete=models.CASCADE)
+
+    @hook(AFTER_SAVE)
+    def notify_group(self):
+        if settings.WORKFLOWS_LOGIC_INSTALLED:
+            workflows_tasks = importlib.import_module("workflows_logic.tasks")
+            workflows_tasks.notify_group_of_change_request_assignment.delay(
+                kwargs={"change_request_group_assignment_id": self.id}
+            )

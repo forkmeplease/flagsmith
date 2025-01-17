@@ -36,6 +36,7 @@ class OrganisationSerializerFull(serializers.ModelSerializer):
         model = Organisation
         fields = (
             "id",
+            "uuid",
             "name",
             "created_date",
             "webhook_notification_email",
@@ -45,6 +46,7 @@ class OrganisationSerializerFull(serializers.ModelSerializer):
             "persist_trait_data",
             "block_access_to_admin",
             "restrict_project_create_to_admin",
+            "force_2fa",
         )
         read_only_fields = (
             "id",
@@ -211,7 +213,7 @@ class PortalUrlSerializer(serializers.Serializer):
 class OrganisationWebhookSerializer(serializers.ModelSerializer):
     class Meta:
         model = OrganisationWebhook
-        fields = ("id", "url", "enabled", "secret")
+        fields = ("id", "url", "enabled", "secret", "created_at", "updated_at")
         read_only_fields = ("id",)
 
 
@@ -243,3 +245,14 @@ class SubscriptionDetailsSerializer(serializers.Serializer):
     max_projects = serializers.IntegerField(source="projects", allow_null=True)
 
     payment_source = serializers.ChoiceField(choices=[None, CHARGEBEE], allow_null=True)
+
+    chargebee_email = serializers.EmailField()
+
+    feature_history_visibility_days = serializers.IntegerField(allow_null=True)
+    audit_log_visibility_days = serializers.IntegerField(allow_null=True)
+
+
+class OrganisationAPIUsageNotificationSerializer(serializers.Serializer):
+    organisation_id = serializers.IntegerField()
+    percent_usage = serializers.IntegerField()
+    notified_at = serializers.DateTimeField()

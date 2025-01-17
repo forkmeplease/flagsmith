@@ -1,49 +1,51 @@
 name: Run E2E tests
-description: "Run the E2E tests against an environment"
+description: Run the E2E tests against an environment
 
 inputs:
   e2e_test_token:
-    description: "The authentication token used for E2E test endpoints."
+    description: The authentication token used for E2E test endpoints.
     required: true
   slack_token:
-    description: "The slack authentication token."
+    description: The slack authentication token.
     required: true
   environment:
-    description: "The value of the ENV environment variable to use for npm run env."
+    description: The value of the ENV environment variable to use for npm run env.
     required: true
-  enable_influxdb_features:
-    description: "Boolean to enable / disable influxdb features"
+  tests:
+    description: The space separated list of E2E tests to be executed.
     required: false
-    default: "true"
 
 runs:
-    using: composite
+  using: composite
 
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          cache: 'npm'
-          node-version-file: 'frontend/.nvmrc'
-          cache-dependency-path: frontend/package-lock.json
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        cache: npm
+        node-version-file: frontend/.nvmrc
+        cache-dependency-path: frontend/package-lock.json
 
-      - name: NPM Install
-        working-directory: frontend
-        run: |
-          npm i
+    - name: NPM Install
+      working-directory: frontend
+      run: |
+        npm ci
+      shell: bash
+
+    - name: Test with Chromedriver
+      uses: nick-fields/retry@v3
+      with:
         shell: bash
-
-      - name: Test with Chromedriver
-        working-directory: frontend
-        env:
-          E2E_TEST_TOKEN: ${{ inputs.e2e_test_token }}
-          SLACK_TOKEN: ${{ inputs.slack_token }}
-          STATIC_ASSET_CDN_URL: /
-          ENV: ${{ inputs.environment }}
-          ENABLE_INFLUXDB_FEATURES: ${{ inputs.enable_influxdb_features }}
-
-        run: |
+        command: |
+          cd frontend
           node -v
           npm run env
-          npm run test
-        shell: bash
+          npm run test -- ${{ inputs.tests }}
+        max_attempts: 2
+        retry_on: error
+        timeout_minutes: 20
+      env:
+        E2E_TEST_TOKEN: ${{ inputs.e2e_test_token }}
+        SLACK_TOKEN: ${{ inputs.slack_token }}
+        ENV: ${{ inputs.environment == 'production' && 'prod' || inputs.environment }}
+        GITHUB_ACTION_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

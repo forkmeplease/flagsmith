@@ -1,46 +1,66 @@
-import { PureComponent } from 'react';
-import CaretDownIcon from './svg/CaretDownIcon';
-import CaretRightIcon from './svg/CaretRightIcon';
+import React, { PureComponent } from 'react'
+import Icon from './Icon'
+import { IonIcon } from '@ionic/react'
+import { chevronDown, chevronForward, createOutline } from 'ionicons/icons'
 
-const cn = require('classnames');
+const cn = require('classnames')
 
 const Collapsible = class extends PureComponent {
-    static displayName = 'Collapsible'
+  static displayName = 'Collapsible'
 
-    static propTypes = {};
-
-    render() {
-        return (
-            <div
-              onClick={this.props.onClick}
-              data-test={this.props['data-test']}
-              className={cn(
-                  'collapsible',
-                  this.props.className,
-                  {
-                      active: this.props.active,
-                  },
-              )}
-            >
-                <div className="collapsible__header">
-                    <div className="flex-row no-wrap">
-                        {this.props.active ? (
-                            <CaretDownIcon className="mr-2" />
-                        ) : <CaretRightIcon className="mr-2" />}
-                        {this.props.title}
-                    </div>
-                </div>
-                {this.props.active ? (
-                    <div className="collapsible__content">
-                        {this.props.children}
-                    </div>
-                ) : null}
-            </div>
-        );
+  static propTypes = {}
+  constructor(props) {
+    super(props)
+    this.ref = React.createRef()
+  }
+  handleClickOutside = (event) => {
+    if (this.ref.current && !this.ref.current.contains(event.target)) {
+      this.props.isProjectSelect &&
+        this.props.onClickOutside &&
+        this.props.onClickOutside()
     }
-};
+  }
 
-Collapsible.displayName = 'Collapsible';
+  componentDidMount() {
+    document.addEventListener('click', this.handleClickOutside, true)
+  }
+
+  componentWillUnmount() {
+    document.removeEventListener('click', this.handleClickOutside, true)
+  }
+
+  render() {
+    return (
+      <div
+        data-test={this.props['data-test']}
+        className={cn('collapsible', this.props.className, {
+          active: this.props.active,
+        })}
+        ref={this.ref}
+      >
+        <div className='collapsible-title mx-3' onClick={this.props.onClick}>
+          <div className='flex-row'>
+            <IonIcon
+              className='fs-small me-2 text-muted'
+              icon={
+                this.props.active || this.props.isProjectSelect
+                  ? chevronDown
+                  : chevronForward
+              }
+            />
+
+            <div>{this.props.title}</div>
+          </div>
+        </div>
+        {this.props.active ? (
+          <div className='collapsible__content'>{this.props.children}</div>
+        ) : null}
+      </div>
+    )
+  }
+}
+
+Collapsible.displayName = 'Collapsible'
 
 // Card.propTypes = {
 //     title: oneOfType([OptionalObject, OptionalString]),
@@ -48,4 +68,4 @@ Collapsible.displayName = 'Collapsible';
 //     children: OptionalNode,
 // };
 
-module.exports = Collapsible;
+module.exports = Collapsible

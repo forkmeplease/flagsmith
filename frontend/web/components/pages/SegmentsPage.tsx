@@ -1,323 +1,354 @@
-import React, {FC, ReactNode, useEffect, useRef, useState} from 'react'; // we need this to make JSX compile
-import CreateSegmentModal from '../modals/CreateSegment';
+import React, { FC, ReactNode, useEffect, useRef, useState } from 'react' // we need this to make JSX compile
+import { RouterChildContext } from 'react-router'
+import { find, sortBy } from 'lodash'
+
 import Constants from 'common/constants'
-import API from '../../project/api'
-import {useDeleteSegmentMutation, useGetSegmentsQuery} from "common/services/useSegment";
-import {Segment} from "common/types/responses";
-import ConfirmRemoveSegment from '../modals/ConfirmRemoveSegment';
-import {find, sortBy} from 'lodash'
-import useThrottle from "../../../common/useThrottle";
-import Button, {ButtonLink} from "../base/forms/Button";
-import {RouterChildContext} from "react-router";
-import JSONReference from "../JSONReference";
-import ConfigProvider from 'common/providers/ConfigProvider';
+import useSearchThrottle from 'common/useSearchThrottle'
+import { Segment } from 'common/types/responses'
+import {
+  useDeleteSegmentMutation,
+  useGetSegmentsQuery,
+} from 'common/services/useSegment'
+import { useHasPermission } from 'common/providers/Permission'
+import API from 'project/api'
+import Button from 'components/base/forms/Button'
+import ConfirmRemoveSegment from 'components/modals/ConfirmRemoveSegment'
+import CreateSegmentModal from 'components/modals/CreateSegment'
+import PanelSearch from 'components/PanelSearch'
+import JSONReference from 'components/JSONReference'
+import ConfigProvider from 'common/providers/ConfigProvider'
 import Utils from 'common/utils/utils'
-const Permission = require('common/providers/Permission')
-const PanelSearch = require("../../components/PanelSearch")
-const Panel = require("../../components/base/grid/Panel")
-const CodeHelp = require("../../components/CodeHelp")
+import ProjectStore from 'common/stores/project-store'
+import Icon from 'components/Icon'
+import PageTitle from 'components/PageTitle'
+import Switch from 'components/Switch'
+import { setModalTitle } from 'components/modals/base/ModalDefault'
+import classNames from 'classnames'
+import InfoMessage from 'components/InfoMessage'
+import { withRouter } from 'react-router-dom'
+
+import CodeHelp from 'components/CodeHelp'
 type SegmentsPageType = {
-    router: RouterChildContext['router']
-    match: {
-        params: {
-            environmentId: string
-            projectId: string
-        }
+  router: RouterChildContext['router']
+  match: {
+    params: {
+      environmentId: string
+      projectId: string
     }
+  }
 }
-
-const HowToUseSegmentsMessage = () => (
-    <div className="mt-2">
-        <p className="alert alert-info">
-            In order to use segments, please set the segment_operators remote config value. <a target="_blank" href="https://docs.flagsmith.com/deployment/overview#running-flagsmith-on-flagsmith">Learn about self hosting</a>.
-        </p>
-    </div>
-);
-
-type PermissionType = { permission:boolean; isLoading:boolean }
 
 const SegmentsPage: FC<SegmentsPageType> = (props) => {
-    const { projectId, environmentId } = props.match.params;
-    const preselect = useRef(Utils.fromParam().id);
-    const hasNoOperators = !Utils.getFlagsmithValue('segment_operators');
-    const [search, _setSearch] = useState("");
-    const [searchInput, setSearchInput] = useState("");
+  const { projectId } = props.match.params
+  const environmentId = ProjectStore.getEnvironment()?.api_key
+  const params = Utils.fromParam()
+  const id = params.id
+  const { search, searchInput, setSearchInput } = useSearchThrottle('')
+  const [page, setPage] = useState(1)
+  const [showFeatureSpecific, setShowFeatureSpecific] = useState(
+    params.featureSpecific === 'true',
+  )
 
-    const [page, setPage] = useState(1);
-    const {data, isLoading, error, refetch} = useGetSegmentsQuery({projectId,page,q:search, page_size:100})
-    const [removeSegment] = useDeleteSegmentMutation()
-    const hasHadResults = useRef(false)
+  useEffect(() => {
+    if (id) {
+      editSegment(id, !manageSegmentsPermission)
+    } else if (!id && typeof closeModal !== 'undefined') {
+      closeModal()
+    }
+  }, [id])
+  const { data, error, isLoading, refetch } = useGetSegmentsQuery({
+    include_feature_specific: showFeatureSpecific,
+    page,
+    page_size: 100,
+    projectId,
+    q: search,
+  })
+  const [removeSegment, { isLoading: isRemoving }] = useDeleteSegmentMutation()
 
-    useEffect(()=>{
-        API.trackPage(Constants.pages.FEATURES);
-    },[])
-    useEffect(()=>{
-        if(error) {
-            // Kick user back out to projects
-            props.router.history.replace('/projects');
+  const segmentsLimitAlert = Utils.calculateRemainingLimitsPercentage(
+    ProjectStore.getTotalSegments(),
+    ProjectStore.getMaxSegmentsAllowed(),
+  )
+
+  useEffect(() => {
+    API.trackPage(Constants.pages.FEATURES)
+  }, [])
+  useEffect(() => {
+    if (error) {
+      // Kick user back out to projects
+      props.router.history.replace(Utils.getOrganisationHomePage())
+    }
+  }, [error, props.router.history])
+
+  useEffect(() => {
+    props.router.history.replace(
+      `${document.location.pathname}?${Utils.toParam({
+        ...Utils.fromParam(),
+        featureSpecific: showFeatureSpecific,
+      })}`,
+    )
+  }, [showFeatureSpecific])
+
+  const newSegment = () => {
+    openModal(
+      'New Segment',
+      <CreateSegmentModal
+        onComplete={(segment) => {
+          //todo: remove when CreateSegment uses hooks
+          setModalTitle(`Edit Segment: ${segment.name}`)
+          toast('Created segment')
+        }}
+        environmentId={environmentId}
+        projectId={projectId}
+      />,
+      'side-modal create-new-segment-modal',
+    )
+  }
+  const confirmRemove = (segment: Segment, cb: () => void) => {
+    openModal(
+      'Remove Segment',
+      <ConfirmRemoveSegment segment={segment} cb={cb} />,
+      'p-0',
+    )
+  }
+
+  const { permission: manageSegmentsPermission } = useHasPermission({
+    id: projectId,
+    level: 'project',
+    permission: 'MANAGE_SEGMENTS',
+  })
+
+  const editSegment = (id: number, readOnly?: boolean) => {
+    API.trackEvent(Constants.events.VIEW_SEGMENT)
+
+    openModal(
+      `Edit Segment`,
+      <CreateSegmentModal
+        key={id}
+        segment={id}
+        onSegmentRetrieved={(segment) => {
+          setShowFeatureSpecific(!!segment?.feature)
+          setModalTitle(`Edit Segment: ${segment.name}`)
+        }}
+        readOnly={readOnly}
+        onComplete={() => {
+          refetch()
+          toast('Updated Segment')
+        }}
+        environmentId={environmentId}
+        projectId={projectId}
+      />,
+      'side-modal create-segment-modal',
+      () => {
+        props.router.history.push(
+          `${document.location.pathname}?${Utils.toParam({
+            ...Utils.fromParam(),
+            id: undefined,
+          })}`,
+        )
+      },
+    )
+  }
+  const renderWithPermission = (
+    permission: boolean,
+    name: string,
+    el: ReactNode,
+  ) => {
+    return permission ? (
+      el
+    ) : (
+      <Tooltip title={el} place='right'>
+        {Constants.projectPermissions('Manage segments')}
+      </Tooltip>
+    )
+  }
+  const segments = data?.results
+  return (
+    <div
+      data-test='segments-page'
+      id='segments-page'
+      className='app-container container'
+    >
+      <PageTitle
+        cta={
+          <>
+            {renderWithPermission(
+              manageSegmentsPermission,
+              'Manage segments',
+              <Button
+                disabled={
+                  !manageSegmentsPermission ||
+                  segmentsLimitAlert.percentage >= 100
+                }
+                id='show-create-segment-btn'
+                data-test='show-create-segment-btn'
+                onClick={newSegment}
+              >
+                Create Segment
+              </Button>,
+            )}
+          </>
         }
-    },[error])
-    const newSegment = () => {
-        openModal('New Segment', <CreateSegmentModal
-            onComplete={()=>{
-                //todo: remove when CreateSegment uses hooks
-                closeModal()
-                refetch()
-            }}
-            environmentId={props.match.params.environmentId}
-            projectId={props.match.params.projectId}
-        />, null, { className: 'fade side-modal create-new-segment-modal' });
-    };
-    const confirmRemove = (segment:Segment, cb?:()=>void) => {
-        openModal('Remove Segment', <ConfirmRemoveSegment
-            environmentId={props.match.params.environmentId}
-            segment={segment}
-            cb={cb}
-        />);
-    }
-    const createSegmentPermission = (el: (permission:boolean)=>ReactNode) => {
-        return (
-            <Permission level="environment" permission="CREATE_SEGMENT" id={props.match.params.environmentId}>
-                {({ permission, isLoading }:PermissionType) => (permission ? (
-                    el(permission)
-                ) : renderWithPermission(permission, "environment", el(permission)))}
-            </Permission>
-        );
-    }
-    const editSegment = (id:number, readOnly?:boolean) => {
-        API.trackEvent(Constants.events.VIEW_SEGMENT);
-        history.replaceState(
-            {},
-            "",
-            `${document.location.pathname}?id=${id}`,
-        );
-
-        openModal(`Edit Segment`, <CreateSegmentModal
-            segment={id}
-            isEdit
-            readOnly={readOnly}
-            onComplete={()=>{
-                refetch()
-                closeModal()
-            }}
-            environmentId={props.match.params.environmentId}
-            projectId={props.match.params.projectId}
-        />, null, {
-            onClose: () => {
-                history.replaceState(
-                    {},
-                    "",
-                    `${document.location.pathname}`,
-                );
-            },
-            className: 'fade side-modal create-segment-modal',
-        });
-
-    };
-    const renderWithPermission = (permission:boolean, name:string, el:ReactNode) => {
-        return permission ? (
-            el
-        ) : (
-            <Tooltip
-                title={el}
-                place="right"
-                html
-            >
-                {Constants.projectPermissions('Manage segments')}
-            </Tooltip>
-        );
-    };
-
-    if(data?.results.length) {
-        hasHadResults.current = true
-    }
-    const setSearch = useThrottle((search:string)=>{
-        _setSearch(search)
-    }, 100)
-    useEffect(()=>{
-        setSearch(searchInput)
-    },[searchInput])
-    const segments = data?.results
-    return (
-        <div data-test="segments-page" id="segments-page" className="app-container container">
-            <Permission level="project" permission="ADMIN" id={projectId}>
-                {({ permission }:PermissionType) => (
-                    <div className="segments-page">
-                                    {isLoading && !hasHadResults.current && (!segments&&!search) && <div className="centered-container"><Loader/></div>}
-                                    {(!isLoading || (segments||search)) && (
+        title={'Segments'}
+      >
+        Create and manage groups of users with similar{' '}
+        <Button
+          theme='text'
+          href='https://docs.flagsmith.com/basic-features/managing-identities#identity-traits'
+          target='_blank'
+        >
+          traits
+        </Button>
+        . Segments can be used to override features within the features page for
+        any environment.{' '}
+        <Button
+          theme='text'
+          target='_blank'
+          href='https://docs.flagsmith.com/basic-features/segments'
+          className='fw-normal'
+        >
+          Learn more.
+        </Button>
+      </PageTitle>
+      <div className='segments-page'>
+        {isLoading && !segments && !searchInput && (
+          <div className='centered-container'>
+            <Loader />
+          </div>
+        )}
+        {(!isLoading || segments || searchInput) && (
+          <div>
+            {Utils.displayLimitAlert('segments', segmentsLimitAlert.percentage)}
+            <div>
+              <FormGroup className={classNames({ 'opacity-50': isRemoving })}>
+                <PanelSearch
+                  filterElement={
+                    <div className='text-right me-2'>
+                      <label className='me-2'>Include Feature-Specific</label>
+                      <Switch
+                        checked={showFeatureSpecific}
+                        onChange={setShowFeatureSpecific}
+                      />
+                    </div>
+                  }
+                  renderSearchWithNoResults
+                  className='no-pad'
+                  id='segment-list'
+                  title=' '
+                  renderFooter={() => (
+                    <JSONReference
+                      className='mx-2 mt-4'
+                      title={'Segments'}
+                      json={segments}
+                    />
+                  )}
+                  items={sortBy(segments, (v) => {
+                    return `${v.feature ? 'a' : 'z'}${v.name}`
+                  })}
+                  renderRow={(
+                    { description, feature, id, name }: Segment,
+                    i: number,
+                  ) => {
+                    return renderWithPermission(
+                      manageSegmentsPermission,
+                      'Manage segments',
+                      <Row className='list-item clickable' key={id} space>
+                        <Flex
+                          className='table-column px-3'
+                          onClick={
+                            manageSegmentsPermission
+                              ? () =>
+                                  props.router.history.push(
+                                    `${
+                                      document.location.pathname
+                                    }?${Utils.toParam({
+                                      ...Utils.fromParam(),
+                                      id,
+                                    })}`,
+                                  )
+                              : undefined
+                          }
+                        >
+                          <Row
+                            data-test={`segment-${i}-name`}
+                            className='font-weight-medium'
+                          >
+                            {name}
+                            {feature && (
+                              <div className='chip chip--xs ml-2'>
+                                Feature-Specific
+                              </div>
+                            )}
+                          </Row>
+                          <div className='list-item-subtitle mt-1'>
+                            {description || 'No description'}
+                          </div>
+                        </Flex>
+                        <div className='table-column'>
+                          <Button
+                            disabled={!manageSegmentsPermission}
+                            data-test={`remove-segment-btn-${i}`}
+                            onClick={() => {
+                              const segment = find(segments, { id })
+                              if (segment) {
+                                confirmRemove(segment, () => {
+                                  removeSegment({ id, projectId }).then(
+                                    (res) => {
+                                      toast(
                                         <div>
-                                            {hasHadResults.current ||  (segments && (segments.length||search)) ? (
-                                                <div>
-                                                    <Row>
-                                                        <Flex>
-                                                            <h3>Segments</h3>
-                                                            <p>
-                                                                Create and manage groups of users with similar traits. Segments can be used to override features within the features page for any environment.
-                                                                {' '}
-                                                                <ButtonLink target="_blank" href="https://docs.flagsmith.com/basic-features/managing-segments">Learn about Segments.</ButtonLink>
-                                                            </p>
-                                                        </Flex>
-                                                        <FormGroup className="float-right">
-                                                            <div className="text-right">
-                                                                {permission ? (
-                                                                    <Button
-                                                                        disabled={hasNoOperators}
-                                                                        className="btn-lg btn-primary"
-                                                                        id="show-create-segment-btn"
-                                                                        data-test="show-create-segment-btn"
-                                                                        onClick={newSegment}
-                                                                    >
-                                                                        Create Segment
-                                                                    </Button>
-                                                                ) : (
-                                                                    <Tooltip
-                                                                        html
-                                                                        title={(
-                                                                            <Button
-                                                                                disabled data-test="show-create-feature-btn" id="show-create-feature-btn"
-                                                                            >
-                                                                                Create Segment
-                                                                            </Button>
-                                                                        )}
-                                                                        place="right"
-                                                                    >
-                                                                        {Constants.projectPermissions('Manage segments')}
-                                                                    </Tooltip>
-                                                                )}
-                                                            </div>
-                                                        </FormGroup>
-                                                    </Row>
-                                                    {hasNoOperators && <HowToUseSegmentsMessage />}
+                                          Removed Segment:{' '}
+                                          <strong>{segment.name}</strong>
+                                        </div>,
+                                      )
+                                    },
+                                  )
+                                })
+                              }
+                            }}
+                            className='btn btn-with-icon'
+                          >
+                            <Icon name='trash-2' width={20} fill='#656D7B' />
+                          </Button>
+                        </div>
+                      </Row>,
+                    )
+                  }}
+                  paging={data}
+                  nextPage={() => setPage(page + 1)}
+                  prevPage={() => setPage(page - 1)}
+                  goToPage={(page: number) => setPage(page)}
+                  search={searchInput}
+                  onChange={(e: any) => {
+                    setSearchInput(Utils.safeParseEventValue(e))
+                  }}
+                  filterRow={() => true}
+                />
+              </FormGroup>
 
-                                                    <FormGroup>
-                                                        <PanelSearch
-                                                            renderSearchWithNoResults
-                                                            className="no-pad"
-                                                            id="segment-list"
-                                                            icon="ion-ios-globe"
-                                                            title="Segments"
-                                                            renderFooter={()=><JSONReference className="mx-2 mt-4" title={"Segments"} json={segments}/>}
-                                                            items={sortBy(segments, (v)=> {
-                                                                return `${v.feature?'z':'a'}${v.name}`
-                                                            })}
-                                                            renderRow={({ name, id, feature, description }:Segment, i:number) => {
-                                                                if (preselect.current === `${id}`) {
-                                                                    editSegment(preselect.current, !permission)
-                                                                    preselect.current = null;
-                                                                }
-                                                                return (
-                                                                    <Row className="list-item clickable" key={id} space>
-                                                                        <div
-                                                                            className="flex flex-1"
-                                                                            onClick={() => editSegment(id, !permission)}
-                                                                        >
-                                                                            <Row>
-                                                                                <ButtonLink>
-                                                                                    <span data-test={`segment-${i}-name`}>
-                                                                                        {name}{ feature &&
-                                                                                        <div className="unread ml-2 px-2">
-                                                                                            {" "}Feature-Specific
-                                                                                        </div>
-                                                                                    }
-                                                                                    </span>
-                                                                                </ButtonLink>
-                                                                            </Row>
-                                                                            <div className="list-item-footer faint">
-                                                                                {description || 'No description'}
-                                                                            </div>
-                                                                        </div>
-                                                                        <Row>
-                                                                            <Column>
-                                                                                <button
-                                                                                    disabled={!permission}
-                                                                                    data-test={`remove-segment-btn-${i}`}
-                                                                                    onClick={() => confirmRemove(find(segments, { id })!, () => {
-                                                                                        removeSegment({projectId:props.match.params.projectId, id});
-                                                                                    })}
-                                                                                    className="btn btn--with-icon"
-                                                                                >
-                                                                                    <RemoveIcon/>
-                                                                                </button>
-                                                                            </Column>
-                                                                        </Row>
-                                                                    </Row>
-                                                                );
-                                                            }}
-                                                            paging={data}
-                                                            nextPage={() => setPage(page+1)}
-                                                            prevPage={() => setPage(page-1)}
-                                                            goToPage={(page:number) => setPage(page)}
-                                                            search={searchInput}
-                                                            onChange={(e:any) => {
-                                                                setSearchInput(Utils.safeParseEventValue(e))
-                                                            }}
-                                                            renderNoResults={(
-                                                                <div className="text-center"/>
-                                                            )}
-                                                            filterRow={({ name, feature }:Segment, search:string) => name.toLowerCase().indexOf(search) > -1}
-                                                        />
-                                                    </FormGroup>
-
-                                                    <div className="mt-2">
-                                                        Segments require you to identitfy users, setting traits will add users to segments.
-                                                    </div>
-                                                    <FormGroup className="mt-4">
-                                                        <CodeHelp
-                                                            title="Using segments"
-                                                            snippets={Constants.codeHelp.USER_TRAITS(environmentId)}
-                                                        />
-                                                    </FormGroup>
-                                                </div>
-                                            ) : (
-                                                <div>
-                                                    <h3>Target groups of users with segments.</h3>
-                                                    <FormGroup>
-                                                        <Panel icon="ion-ios-globe" title="1. creating a segment">
-                                                            <p>
-                                                                You can create a segment that targets
-                                                                {' '}
-                                                                <ButtonLink
-                                                                    href="https://docs.flagsmith.com/basic-features/managing-identities#identity-traits"
-                                                                    target="_blank"
-                                                                >User Traits
-                                                                </ButtonLink>
-                                                                .
-                                                                As user's traits are updated they will automatically be added to
-                                                                the segments based on the rules you create. <ButtonLink href="https://docs.flagsmith.com/basic-features/managing-segments" target="_blank">Check out the documentation on Segments</ButtonLink>.
-                                                            </p>
-                                                        </Panel>
-                                                    </FormGroup>
-                                                    {createSegmentPermission(perm => (
-                                                        <FormGroup className="text-center">
-                                                            <Button
-                                                                disabled={!perm || hasNoOperators}
-                                                                className="btn-lg btn-primary" id="show-create-segment-btn" data-test="show-create-segment-btn"
-                                                                onClick={newSegment}
-                                                            >
-                                                                <span className="icon ion-ios-globe"/>
-                                                                {' '}
-                                                                Create your first Segment
-                                                            </Button>
-                                                        </FormGroup>
-                                                    ))}
-                                                    {hasNoOperators && <HowToUseSegmentsMessage />}
-                                                </div>
-                                            )}
-                                        </div>
-                                    )}
-                                    <FormGroup>
-                                        <CodeHelp
-                                            title="Managing user traits and segments"
-                                            snippets={Constants.codeHelp.USER_TRAITS(props.match.params.environmentId)}
-                                        />
-                                    </FormGroup>
-                                </div>
-                )}
-            </Permission>
-        </div>
-    );
+              <InfoMessage collapseId={'segment-identify'}>
+                Segments require you to identitfy users, setting traits will add
+                users to segments.
+              </InfoMessage>
+              <FormGroup className='mt-4'>
+                <CodeHelp
+                  title='Using segments'
+                  snippets={Constants.codeHelp.USER_TRAITS(
+                    environmentId || 'ENVIRONMENT_KEY',
+                  )}
+                />
+              </FormGroup>
+            </div>
+          </div>
+        )}
+        <FormGroup>
+          <CodeHelp
+            title='Managing user traits and segments'
+            snippets={Constants.codeHelp.USER_TRAITS(environmentId)}
+          />
+        </FormGroup>
+      </div>
+    </div>
+  )
 }
 
-
-
-module.exports = ConfigProvider(SegmentsPage);
+module.exports = ConfigProvider(withRouter(SegmentsPage))

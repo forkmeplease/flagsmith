@@ -20,6 +20,10 @@
             "essential": true,
             "environment": [
                 {
+                    "name": "LOG_LEVEL",
+                    "value": "INFO"
+                },
+                {
                     "name": "AWS_REGION",
                     "value": "eu-west-2"
                 },
@@ -42,6 +46,10 @@
                 {
                     "name": "CACHE_PROJECT_SEGMENTS_SECONDS",
                     "value": "10"
+                },
+                {
+                    "name": "CACHE_ENVIRONMENT_SEGMENTS_SECONDS",
+                    "value": "30"
                 },
                 {
                     "name": "CHARGEBEE_SITE",
@@ -68,8 +76,12 @@
                     "value": "flagsmith_environments"
                 },
                 {
-                    "name": "FE_E2E_TEST_USER_EMAIL",
-                    "value": "nightwatch@solidstategroup.com"
+                    "name": "ENVIRONMENTS_V2_TABLE_NAME_DYNAMO",
+                    "value": "flagsmith_environments_v2"
+                },
+                {
+                    "name": "ENABLE_FE_E2E",
+                    "value": "True"
                 },
                 {
                     "name": "GITHUB_CLIENT_ID",
@@ -104,10 +116,6 @@
                     "value": "https://eu-central-1-1.aws.cloud2.influxdata.com"
                 },
                 {
-                    "name": "MAILERLITE_NEW_USER_GROUP_ID",
-                    "value": "110227625"
-                },
-                {
                     "name": "OAUTH_CLIENT_ID",
                     "value": "232959427810-br6ltnrgouktp0ngsbs04o14ueb9rch0.apps.googleusercontent.com"
                 },
@@ -125,19 +133,15 @@
                 },
                 {
                     "name": "SENTRY_TRACE_SAMPLE_RATE",
-                    "value": "0.0005"
+                    "value": "0.000003"
                 },
                 {
                     "name": "DASHBOARD_ENDPOINTS_SENTRY_TRACE_SAMPLE_RATE",
-                    "value": "0.1"
+                    "value": "0.002"
                 },
                 {
                     "name": "SLACK_CLIENT_ID",
                     "value": "937916178726.1924685747446"
-                },
-                {
-                    "name": "EDGE_API_URL",
-                    "value": "https://edge.api.flagsmith.com/api/v1/"
                 },
                 {
                     "name": "IDENTITY_MIGRATION_EVENT_BUS_NAME",
@@ -146,6 +150,14 @@
                 {
                     "name": "ENVIRONMENTS_API_KEY_TABLE_NAME_DYNAMO",
                     "value": "flagsmith_environment_api_key"
+                },
+                {
+                    "name": "CACHE_BAD_ENVIRONMENTS_SECONDS",
+                    "value": "60"
+                },
+                {
+                    "name": "FEATURE_EVALUATION_CACHE_SECONDS",
+                    "value": "300"
                 },
                 {
                     "name": "EDGE_RELEASE_DATETIME",
@@ -166,6 +178,22 @@
                 {
                     "name": "ENABLE_PIPEDRIVE_LEAD_TRACKING",
                     "value": "True"
+                },
+                {
+                    "name": "AUTO_SEAT_UPGRADE_PLANS",
+                    "value": "scale-up-12-months-v2-gbp,scale-up-12-months-v2-eur,scale-up-12-months-v2,scale-up-quarterly-v2-semiannual,scale-up-quarterly-v2,scale-up-v2,scale-up-24-months-v2"
+                },
+                {
+                    "name": "PIPEDRIVE_IGNORE_DOMAINS",
+                    "value": "flagsmith.com,solidstategroup.com,restmail.net,bullettrain.io,flagsmithe2etestdomain.io"
+                },
+                {
+                    "name": "ENABLE_HUBSPOT_LEAD_TRACKING",
+                    "value": "True"
+                },
+                {
+                    "name": "GITHUB_APP_ID",
+                    "value": "811209"
                 }
             ],
             "secrets": [
@@ -198,10 +226,6 @@
                     "valueFrom": "arn:aws:secretsmanager:eu-west-2:084060095745:secret:ECS-API-LxUiIQ:INFLUXDB_TOKEN::"
                 },
                 {
-                    "name": "MAILERLITE_API_KEY",
-                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:084060095745:secret:ECS-API-LxUiIQ:MAILERLITE_API_KEY::"
-                },
-                {
                     "name": "OAUTH_CLIENT_SECRET",
                     "valueFrom": "arn:aws:secretsmanager:eu-west-2:084060095745:secret:ECS-API-LxUiIQ:OAUTH_CLIENT_SECRET::"
                 },
@@ -224,6 +248,14 @@
                 {
                     "name": "SSE_AUTHENTICATION_TOKEN",
                     "valueFrom": "arn:aws:secretsmanager:eu-west-2:084060095745:secret:ECS-API-LxUiIQ:SSE_AUTHENTICATION_TOKEN::"
+                },
+                {
+                    "name": "GITHUB_WEBHOOK_SECRET",
+                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:084060095745:secret:ECS-API-LxUiIQ:GITHUB_WEBHOOK_SECRET::"
+                },
+                {
+                    "name": "GITHUB_PEM",
+                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:084060095745:secret:GITHUB_PEM-E1Ot8p"
                 }
             ],
             "logConfiguration": {

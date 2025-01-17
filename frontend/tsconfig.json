@@ -19,11 +19,17 @@
     "paths": {
       "common/*": [
         "./common/*"
+      ],
+      "components/*": [
+        "./web/components/*"
+      ],
+      "project/*": [
+        "./web/project/*"
       ]
     }
   },
   "exclude": [
-    "node_modules",
+    "node_modules"
   ],
   "include": [
     "global.d.ts",

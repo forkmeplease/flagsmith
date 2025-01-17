@@ -1,0 +1,57 @@
+name: Run API tests with private package
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [labeled]
+
+defaults:
+  run:
+    working-directory: api
+
+jobs:
+  test:
+    if: ${{ github.event.label.name == 'api' }}
+    runs-on: ubuntu-latest
+    name: API Tests
+
+    services:
+      postgres:
+        image: postgres:15.5-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - name: Cloning repo
+        uses: actions/checkout@v4
+
+      - name: Install poetry
+        run: pipx install poetry
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'poetry'
+
+      - name: Install SAML Dependencies
+        run: sudo apt-get install -y xmlsec1
+
+      - name: Install packages and Tests
+        if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "https://${{ secrets.GH_PRIVATE_ACCESS_TOKEN }}:@github.com" > ${HOME}/.git-credentials
+          git config --global credential.helper store
+          make install-packages opts="--with saml,auth-controller,workflows"
+          make install-private-modules
+          make integrate-private-tests
+          rm -rf ${HOME}/.git-credentials
+
+      - name: Run Tests
+        env:
+          DOTENV_OVERRIDE_FILE: .env-ci
+        run: make test

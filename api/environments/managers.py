@@ -3,35 +3,29 @@ from softdelete.models import SoftDeleteManager
 
 from features.models import FeatureSegment, FeatureState
 from features.multivariate.models import MultivariateFeatureStateValue
+from segments.models import Segment
 
 
 class EnvironmentManager(SoftDeleteManager):
-    def filter_for_document_builder(self, *args, **kwargs):
+    def filter_for_document_builder(
+        self,
+        *args,
+        extra_select_related: list[str] | None = None,
+        extra_prefetch_related: list[Prefetch | str] | None = None,
+        **kwargs,
+    ):
         return (
-            super(EnvironmentManager, self)
+            super()
             .select_related(
                 "project",
                 "project__organisation",
-                "mixpanel_config",
-                "segment_config",
-                "amplitude_config",
-                "heap_config",
-                "dynatrace_config",
+                *extra_select_related or (),
             )
             .prefetch_related(
                 Prefetch(
-                    "feature_states",
-                    queryset=FeatureState.objects.select_related(
-                        "feature", "feature_state_value"
-                    ),
+                    "project__segments",
+                    queryset=Segment.live_objects.all(),
                 ),
-                Prefetch(
-                    "feature_states__multivariate_feature_state_values",
-                    queryset=MultivariateFeatureStateValue.objects.select_related(
-                        "multivariate_feature_option"
-                    ),
-                ),
-                "project__segments",
                 "project__segments__rules",
                 "project__segments__rules__rules",
                 "project__segments__rules__conditions",
@@ -44,7 +38,7 @@ class EnvironmentManager(SoftDeleteManager):
                 Prefetch(
                     "project__segments__feature_segments__feature_states",
                     queryset=FeatureState.objects.select_related(
-                        "feature", "feature_state_value"
+                        "feature", "feature_state_value", "environment"
                     ),
                 ),
                 Prefetch(
@@ -53,6 +47,7 @@ class EnvironmentManager(SoftDeleteManager):
                         "multivariate_feature_option"
                     ),
                 ),
+                *extra_prefetch_related or (),
             )
             .filter(*args, **kwargs)
         )

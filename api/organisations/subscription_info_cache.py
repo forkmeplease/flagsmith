@@ -1,21 +1,22 @@
 import typing
+from datetime import timedelta
 
 from app_analytics.influxdb_wrapper import get_top_organisations
 from django.conf import settings
 from django.utils import timezone
 
-from .chargebee import get_subscription_metadata
+from .chargebee import get_subscription_metadata_from_id
 from .models import Organisation, OrganisationSubscriptionInformationCache
-from .subscriptions.constants import CHARGEBEE
+from .subscriptions.constants import CHARGEBEE, SubscriptionCacheEntity
 
 OrganisationSubscriptionInformationCacheDict = typing.Dict[
     int, OrganisationSubscriptionInformationCache
 ]
 
 
-def update_caches():
+def update_caches(update_cache_entities: typing.Tuple[SubscriptionCacheEntity, ...]):
     """
-    Update the cache objects for all active organisations in the database.
+    Update the cache objects for an update_cache_entity in the database.
     """
 
     organisations = Organisation.objects.select_related(
@@ -30,14 +31,16 @@ def update_caches():
         for org in organisations
     }
 
-    _update_caches_with_influx_data(organisation_info_cache_dict)
-    _update_caches_with_chargebee_data(organisations, organisation_info_cache_dict)
+    if SubscriptionCacheEntity.INFLUX in update_cache_entities:
+        _update_caches_with_influx_data(organisation_info_cache_dict)
+
+    if SubscriptionCacheEntity.CHARGEBEE in update_cache_entities:
+        _update_caches_with_chargebee_data(organisations, organisation_info_cache_dict)
 
     to_update = []
     to_create = []
 
     for subscription_info_cache in organisation_info_cache_dict.values():
-        subscription_info_cache.updated_at = timezone.now()
         if subscription_info_cache.id:
             to_update.append(subscription_info_cache)
         else:
@@ -52,7 +55,9 @@ def update_caches():
             "api_calls_30d",
             "allowed_seats",
             "allowed_30d_api_calls",
-            "updated_at",
+            "chargebee_email",
+            "chargebee_updated_at",
+            "influx_updated_at",
         ],
     )
 
@@ -67,15 +72,34 @@ def _update_caches_with_influx_data(
     if not settings.INFLUXDB_TOKEN:
         return
 
-    for date_range, limit in (("30d", ""), ("7d", ""), ("24h", "100")):
-        key = f"api_calls_{date_range}"
-        org_calls = get_top_organisations(date_range, limit)
+    for _date_start, limit in (("-30d", ""), ("-7d", ""), ("-24h", "100")):
+        key = f"api_calls_{_date_start[1:]}"
+
+        now = timezone.now()
+        if _date_start.endswith("d"):
+            date_start = now - timedelta(days=int(_date_start[1:-1]))
+        elif _date_start.endswith("h"):
+            date_start = now - timedelta(hours=int(_date_start[1:-1]))
+        else:
+            assert False, "Expecting either days (d) or hours (h)"  # pragma: no cover
+
+        org_calls = get_top_organisations(date_start, limit)
+
+        covered_orgs = set()
+
         for org_id, calls in org_calls.items():
             subscription_info_cache = organisation_info_cache_dict.get(org_id)
+            covered_orgs.add(org_id)
+
             if not subscription_info_cache:
                 # I don't think this is a valid case but worth checking / handling
                 continue
             setattr(subscription_info_cache, key, calls)
+
+        for org_id in organisation_info_cache_dict:
+            if org_id not in covered_orgs:
+                subscription_info_cache = organisation_info_cache_dict.get(org_id)
+                setattr(subscription_info_cache, key, 0)
 
 
 def _update_caches_with_chargebee_data(
@@ -98,10 +122,11 @@ def _update_caches_with_chargebee_data(
         ):
             continue
 
-        metadata = get_subscription_metadata(subscription.subscription_id)
+        metadata = get_subscription_metadata_from_id(subscription.subscription_id)
         if not metadata:
             continue
 
         subscription_info_cache = organisation_info_cache_dict[organisation.id]
         subscription_info_cache.allowed_seats = metadata.seats
         subscription_info_cache.allowed_30d_api_calls = metadata.api_calls
+        subscription_info_cache.chargebee_email = metadata.chargebee_email

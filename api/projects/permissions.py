@@ -1,24 +1,13 @@
 import typing
-from contextlib import suppress
 
+from common.projects.permissions import VIEW_PROJECT
 from django.db.models import Model
-from django.http import HttpRequest
 from rest_framework.exceptions import APIException, PermissionDenied
 from rest_framework.permissions import BasePermission, IsAuthenticated
 
 from organisations.models import Organisation
 from organisations.permissions.permissions import CREATE_PROJECT
 from projects.models import Project
-
-# Maintain a list of permissions here
-PROJECT_PERMISSIONS = [
-    ("VIEW_PROJECT", "View permission for the given project."),
-    ("CREATE_ENVIRONMENT", "Ability to create an environment in the given project."),
-    ("DELETE_FEATURE", "Ability to delete features in the given project."),
-    ("CREATE_FEATURE", "Ability to create features in the given project."),
-    ("EDIT_FEATURE", "Ability to edit features in the given project."),
-    ("MANAGE_SEGMENTS", "Ability to manage segments in the given project."),
-]
 
 
 class ProjectPermissions(IsAuthenticated):
@@ -30,9 +19,24 @@ class ProjectPermissions(IsAuthenticated):
         if view.action == "create" and request.user.belongs_to(
             int(request.data.get("organisation"))
         ):
-            organisation = Organisation.objects.get(
+            organisation = Organisation.objects.select_related("subscription").get(
                 id=int(request.data.get("organisation"))
             )
+
+            # Allow project creation based on the active subscription
+            subscription_metadata = (
+                organisation.subscription.get_subscription_metadata()
+            )
+
+            total_projects_created = Project.objects.filter(
+                organisation=organisation
+            ).count()
+            if (
+                subscription_metadata.projects
+                and total_projects_created >= subscription_metadata.projects
+                and not getattr(request, "is_e2e", False) is True
+            ):
+                return False
             if organisation.restrict_project_create_to_admin:
                 return request.user.is_organisation_admin(organisation.pk)
             return request.user.has_organisation_permission(
@@ -46,48 +50,18 @@ class ProjectPermissions(IsAuthenticated):
 
     def has_object_permission(self, request, view, obj):
         """Check if user has permission to view / edit / delete project"""
-        if request.user.is_anonymous:
-            return False
-
         if request.user.is_project_admin(obj):
             return True
 
         if view.action == "retrieve" and request.user.has_project_permission(
-            "VIEW_PROJECT", obj
+            VIEW_PROJECT, obj
         ):
-            return True
-
-        if view.action in ("update", "destroy") and request.user.is_project_admin(obj):
             return True
 
         if view.action == "user_permissions":
             return True
 
         return False
-
-
-class MasterAPIKeyProjectPermissions(BasePermission):
-    def has_permission(self, request: HttpRequest, view: str) -> bool:
-        master_api_key = getattr(request, "master_api_key", None)
-
-        if not master_api_key:
-            return False
-
-        if view.action == "create":
-            organisation_id = int(request.data.get("organisation"))
-            return organisation_id == master_api_key.organisation_id
-
-        if view.action in ("list", "permissions", "get_by_uuid"):
-            return True
-
-        # move on to object specific permissions
-        return view.detail
-
-    def has_object_permission(
-        self, request: HttpRequest, view: str, obj: Project
-    ) -> bool:
-        master_api_key = request.master_api_key
-        return master_api_key.organisation_id == obj.organisation_id
 
 
 class IsProjectAdmin(BasePermission):
@@ -137,7 +111,7 @@ class NestedProjectPermissions(IsAuthenticated):
     ):
         super().__init__(*args, **kwargs)
         self.action_permission_map = action_permission_map or {}
-        self.action_permission_map.setdefault("list", "VIEW_PROJECT")
+        self.action_permission_map.setdefault("list", VIEW_PROJECT)
 
         self.get_project_from_object_callable = get_project_from_object_callable
 
@@ -156,12 +130,12 @@ class NestedProjectPermissions(IsAuthenticated):
                 self.action_permission_map[view.action], project
             )
 
+        if view.action == "create":
+            return request.user.is_project_admin(project)
+
         return view.detail
 
     def has_object_permission(self, request, view, obj):
-        if request.user.is_anonymous:
-            return False
-
         if view.action in self.action_permission_map:
             return request.user.has_project_permission(
                 self.action_permission_map[view.action],
@@ -169,30 +143,3 @@ class NestedProjectPermissions(IsAuthenticated):
             )
 
         return request.user.is_project_admin(self.get_project_from_object_callable(obj))
-
-
-class NestedProjectMasterAPIKeyPermissions(BasePermission):
-    # NOTE: In order to compose different permissions using Python bitwise operators
-    # all the permissions must have same __init__ signature. The __init__ method defined below
-    # provides the same signature as the one defined in the NestedProjectPermissions class
-    # to support composition using bitwise operators.
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-
-    def has_permission(self, request: HttpRequest, view: str) -> bool:
-        master_api_key = getattr(request, "master_api_key", None)
-
-        if not master_api_key:
-            return False
-
-        with suppress(Project.DoesNotExist):
-            project_id = view.kwargs.get("project_pk")
-            project = Project.objects.get(id=project_id)
-
-            return project.organisation_id == master_api_key.organisation_id
-        return False
-
-    def has_object_permission(
-        self, request: HttpRequest, view: str, obj: Model
-    ) -> bool:
-        return self.has_permission(request, view)

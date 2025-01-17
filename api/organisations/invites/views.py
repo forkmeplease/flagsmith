@@ -14,6 +14,9 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.viewsets import GenericViewSet
 
+from integrations.lead_tracking.hubspot.services import (
+    register_hubspot_tracker,
+)
 from organisations.invites.exceptions import InviteExpiredError
 from organisations.invites.models import Invite, InviteLink
 from organisations.invites.serializers import (
@@ -44,6 +47,8 @@ def join_organisation_from_email(request, hash):
         error_data = {"detail": str(e)}
         return Response(data=error_data, status=status.HTTP_400_BAD_REQUEST)
 
+    register_hubspot_tracker(request)
+
     return Response(
         OrganisationSerializerFull(
             invite.organisation, context={"request": request}
@@ -61,6 +66,8 @@ def join_organisation_from_link(request, hash):
 
     if invite.is_expired:
         raise InviteExpiredError()
+
+    register_hubspot_tracker(request)
 
     request.user.join_organisation_from_invite_link(invite)
 
@@ -83,8 +90,20 @@ class InviteLinkViewSet(
     pagination_class = None
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return InviteLink.objects.none()
+
         organisation_pk = self.kwargs.get("organisation_pk")
         user = self.request.user
+        organisation = Organisation.objects.get(id=organisation_pk)
+
+        if (
+            settings.ENABLE_CHARGEBEE
+            and organisation.over_plan_seats_limit(additional_seats=1)
+            and not organisation.is_auto_seat_upgrade_available()
+        ):
+            raise SubscriptionDoesNotSupportSeatUpgrade()
+
         return InviteLink.objects.filter(
             organisation__in=user.organisations.all()
         ).filter(organisation__pk=organisation_pk)
@@ -111,6 +130,9 @@ class InviteViewSet(
         }.get(self.action, InviteListSerializer)
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return Invite.objects.none()
+
         organisation_pk = self.kwargs.get("organisation_pk")
         user = self.request.user
 
