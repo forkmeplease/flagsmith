@@ -1,100 +1,127 @@
-import React, { Component } from 'react';
-import InfoMessage from '../InfoMessage';
-import PaymentModal from './Payment';
+import React, { Component } from 'react'
+import InfoMessage from 'components/InfoMessage'
+import ErrorMessage from 'components/ErrorMessage'
+import Button from 'components/base/forms/Button'
+import Constants from 'common/constants'
+import { setInterceptClose } from './base/ModalDefault'
+import PlanBasedAccess from 'components/PlanBasedAccess'
 
 const CreateProject = class extends Component {
-    static displayName = 'CreateProject'
+  static displayName = 'CreateProject'
 
-    constructor(props, context) {
-        super(props, context);
-        this.state = {};
+  constructor(props, context) {
+    super(props, context)
+    this.state = {}
+  }
+
+  close = (data = {}) => {
+    setInterceptClose(null)
+    closeModal()
+    if (data) {
+      const { environmentId, projectId } = data
+      this.props.history.push(
+        `/project/${projectId}/environment/${environmentId}/features?new=true`,
+      )
+      this.props.onSave?.(data)
     }
+  }
 
-    close = (id) => {
-        closeModal();
-        this.props.onSave(id);
+  componentDidMount = () => {
+    this.focusTimeout = setTimeout(() => {
+      this.input.focus()
+      this.focusTimeout = null
+    }, 500)
+
+    setInterceptClose(() => {
+      return new Promise((resolve) => {
+        this.props.history.push(document.location.pathname)
+        setInterceptClose(null)
+        resolve(true)
+      })
+    })
+  }
+
+  componentWillUnmount() {
+    if (this.focusTimeout) {
+      clearTimeout(this.focusTimeout)
     }
+  }
 
-    componentDidMount = () => {
-        this.focusTimeout = setTimeout(() => {
-            this.input.focus();
-            this.focusTimeout = null;
-        }, 500);
-    };
-
-    componentWillUnmount() {
-        if (this.focusTimeout) {
-            clearTimeout(this.focusTimeout);
-        }
-    }
-
-    render() {
-        const { name } = this.state;
-        return (
-            <OrganisationProvider onSave={this.close}>
-                {({ isLoading, isSaving, projects, createProject, error }) => {
-                    const hasProject = !!projects && !!projects.length;
-                    const canCreate = !!Utils.getPlansPermission('CREATE_ADDITIONAL_PROJECT');
-                    const disableCreate = !canCreate && hasProject;
-
-                    return (
-                        <div>
-
-                            {disableCreate && (
-                                <InfoMessage>
-                                    View and manage multiple projects in your organisation with the <a
-                                      href="#" onClick={() => {
-                                          openModal('Payment plans', <PaymentModal
-                                            viewOnly={false}
-                                          />, null, { large: true });
-                                      }}
-                                    >
-                                    Startup plan
-                                    </a>
-                                </InfoMessage>
-                            )}
-                            <form
-                              style={{ opacity: disableCreate ? 0.5 : 1 }}
-                              data-test="create-project-modal"
-                              id="create-project-modal" onSubmit={(e) => {
-                                  if (disableCreate) {
-                                      return;
-                                  }
-                                  e.preventDefault();
-                                  !isSaving && name && createProject(name);
-                              }}
-                            >
-
-                                <InputGroup
-                                  ref={e => this.input = e}
-                                  data-test="projectName"
-                                  disabled={disableCreate}
-                                  inputProps={{ name: 'projectName', className: 'full-width' }}
-                                  onChange={e => this.setState({ name: Utils.safeParseEventValue(e) })}
-                                  isValid={name && name.length}
-                                  type="text" title="Project Name*"
-                                  placeholder="My Product Name"
-                                />
-                                {error && <Error error={error}/>}
-                                <div className="text-right">
-                                    <Button
-                                      data-test="create-project-btn" className="mt-3" id="create-project-btn"
-                                      disabled={isSaving || !name}
-                                    >
-                                        {isSaving ? 'Creating' : 'Create Project'}
-                                    </Button>
-                                </div>
-                            </form>
-                        </div>
-
-                    );
+  render() {
+    const { name } = this.state
+    return (
+      <OrganisationProvider onSave={this.close}>
+        {({ createProject, error, isSaving, projects }) => {
+          const hasProject = !!projects && !!projects.length
+          const canCreate =
+            !hasProject ||
+            !!Utils.getPlansPermission('CREATE_ADDITIONAL_PROJECT')
+          const disableCreate = !canCreate
+          const inner = (
+            <div className='p-4'>
+              <form
+                style={{ opacity: disableCreate ? 0.5 : 1 }}
+                data-test='create-project-modal'
+                id='create-project-modal'
+                onSubmit={(e) => {
+                  if (disableCreate) {
+                    return
+                  }
+                  e.preventDefault()
+                  !isSaving && name && createProject(name)
                 }}
+              >
+                <InputGroup
+                  ref={(e) => (this.input = e)}
+                  data-test='projectName'
+                  disabled={disableCreate}
+                  className='mb-0'
+                  inputProps={{
+                    className: 'full-width',
+                    name: 'projectName',
+                  }}
+                  onChange={(e) =>
+                    this.setState({ name: Utils.safeParseEventValue(e) })
+                  }
+                  isValid={name && name.length}
+                  type='text'
+                  title='Project Name*'
+                  placeholder='My Product Name'
+                />
+                {error && <ErrorMessage error={error} />}
+                <div className='text-right mt-5'>
+                  <Button
+                    type='submit'
+                    data-test='create-project-btn'
+                    id='create-project-btn'
+                    disabled={!canCreate || isSaving || !name}
+                    className='text-right'
+                  >
+                    {isSaving ? 'Creating' : 'Create Project'}
+                  </Button>
+                </div>
+              </form>
+            </div>
+          )
+          if (hasProject) {
+            return (
+              <>
+                <PlanBasedAccess
+                  className='p-4'
+                  feature={'CREATE_ADDITIONAL_PROJECT'}
+                  theme={'page'}
+                />
+                {inner}
+              </>
+            )
+          }
+          return inner
+        }}
+      </OrganisationProvider>
+    )
+  }
+}
 
-            </OrganisationProvider>
-        );
-    }
-};
+CreateProject.propTypes = {}
 
-CreateProject.propTypes = {};
-
-module.exports = CreateProject;
+export default CreateProject

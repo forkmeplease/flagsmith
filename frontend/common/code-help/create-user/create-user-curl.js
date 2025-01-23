@@ -1,5 +1,9 @@
-module.exports = (envId, _, userId) => `// Identify/create user
+import Constants from 'common/constants'
 
-curl 'https://edge.api.flagsmith.com/api/v1/identities/?identifier=${userId}'
+module.exports = (envId, { USER_ID }, userId) => `// Identify/create user
+
+curl -i '${Constants.getFlagsmithSDKUrl()}identities/?identifier=${
+  userId || USER_ID
+}' \\
      -H 'x-environment-key: ${envId}'
-`;
+`

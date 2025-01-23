@@ -1,31 +1,50 @@
-from django.conf import settings
+from contextlib import suppress
+
+from core.helpers import get_current_site_url
 from django.contrib.auth.mixins import PermissionRequiredMixin
-from django.contrib.sites.shortcuts import get_current_site
-from django.db.models import QuerySet
-from django.http import Http404, HttpResponse
-from django.shortcuts import redirect
+from django.db.models import Prefetch, Q, QuerySet
+from django.http import (
+    Http404,
+    HttpRequest,
+    HttpResponseRedirect,
+    JsonResponse,
+)
+from django.shortcuts import get_object_or_404, redirect
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.generic.edit import FormView
-from drf_yasg2.utils import swagger_auto_schema
+from drf_yasg.utils import swagger_auto_schema
 from rest_framework import mixins, status, viewsets
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
 from rest_framework.response import Response
 
-from organisations.models import Organisation
+from organisations.models import Organisation, UserOrganisation
 from organisations.permissions.permissions import (
+    MANAGE_USER_GROUPS,
+    NestedIsOrganisationAdminPermission,
     OrganisationUsersPermission,
     UserPermissionGroupPermission,
 )
 from organisations.serializers import UserOrganisationSerializer
-from users.models import FFAdminUser, UserPermissionGroup
+from users.models import (
+    FFAdminUser,
+    UserPermissionGroup,
+    UserPermissionGroupMembership,
+)
 from users.serializers import (
+    ListUserPermissionGroupSerializer,
     ListUsersQuerySerializer,
     UserIdsSerializer,
     UserListSerializer,
     UserPermissionGroupSerializerDetail,
+    UserPermissionGroupSummarySerializer,
+)
+from users.services import (
+    create_initial_superuser,
+    should_skip_create_initial_superuser,
 )
 
 from .forms import InitConfigForm
@@ -39,31 +58,40 @@ class InitialConfigurationView(PermissionRequiredMixin, FormView):
     )
 
     def has_permission(self):
-        return FFAdminUser.objects.count() == 0
+        return not should_skip_create_initial_superuser()
 
     def handle_no_permission(self):
         raise Http404("CAN NOT INIT CONFIGURATION. USER(S) ALREADY EXIST IN SYSTEM.")
 
     def form_valid(self, form):
-        form.create_admin()
         form.update_site()
-        return HttpResponse("INSTALLATION CONFIGURED SUCCESSFULLY")
+        password_reset_url = form.create_admin().password_reset_url
+        return JsonResponse(
+            {
+                "message": "INSTALLATION CONFIGURED SUCCESSFULLY",
+                "passwordResetUrl": password_reset_url,
+            }
+        )
 
 
 class AdminInitView(View):
     def get(self, request):
-        if FFAdminUser.objects.count() == 0:
-            admin = FFAdminUser.objects.create_superuser(
-                settings.ADMIN_EMAIL,
-                settings.ADMIN_INITIAL_PASSWORD,
-                is_active=True,
+        if should_skip_create_initial_superuser():
+            return JsonResponse(
+                {
+                    "adminUserCreated": False,
+                    "message": "FAILED TO INIT ADMIN USER. USER(S) ALREADY EXIST IN SYSTEM.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
-            admin.save()
-            return HttpResponse("ADMIN USER CREATED")
-        else:
-            return HttpResponse(
-                "FAILED TO INIT ADMIN USER. USER(S) ALREADY EXIST IN SYSTEM."
-            )
+        response = create_initial_superuser()
+        return JsonResponse(
+            {
+                "adminUserCreated": True,
+                "passwordResetUrl": response.password_reset_url,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 @method_decorator(
@@ -76,9 +104,12 @@ class FFAdminUserViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
 
     def get_queryset(self):
         if self.kwargs.get("organisation_pk"):
-            queryset = FFAdminUser.objects.filter(
-                organisations__id=self.kwargs.get("organisation_pk")
-            )
+            queryset = FFAdminUser.objects.prefetch_related(
+                Prefetch(
+                    "userorganisation_set",
+                    queryset=UserOrganisation.objects.select_related("organisation"),
+                )
+            ).filter(organisations__id=self.kwargs.get("organisation_pk"))
             queryset = self._apply_query_filters(queryset)
             return queryset
         else:
@@ -125,22 +156,71 @@ class FFAdminUserViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
         )
 
 
-def password_reset_redirect(request, uidb64, token):
-    protocol = "https" if request.is_secure() else "https"
-    current_site = get_current_site(request)
-    domain = current_site.domain
-    return redirect(
-        protocol + "://" + domain + "/password-reset/" + uidb64 + "/" + token
-    )
+def password_reset_redirect(
+    request: HttpRequest,
+    uidb64: str,
+    token: str,
+) -> HttpResponseRedirect:
+    current_site_url = get_current_site_url(request)
+    return redirect(f"{current_site_url}/password-reset/{uidb64}/{token}")
 
 
 class UserPermissionGroupViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, UserPermissionGroupPermission]
-    serializer_class = UserPermissionGroupSerializerDetail
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return UserPermissionGroup.objects.none()
+
         organisation_pk = self.kwargs.get("organisation_pk")
-        return UserPermissionGroup.objects.filter(organisation__pk=organisation_pk)
+        organisation = Organisation.objects.get(id=organisation_pk)
+
+        qs = UserPermissionGroup.objects.filter(organisation=organisation)
+        if (
+            self.action != "summaries"
+            and not self.request.user.has_organisation_permission(
+                organisation, MANAGE_USER_GROUPS
+            )
+        ):
+            # my_groups and summaries return a very cut down set of data, we can safely allow all users
+            # of the groups / organisation to retrieve them in this case, otherwise they must be a group admin.
+            q = Q(userpermissiongroupmembership__ffadminuser=self.request.user)
+            if self.action != "my_groups":
+                q = q & Q(userpermissiongroupmembership__group_admin=True)
+            qs = qs.filter(q)
+
+        if self.action == "list":
+            qs = qs.prefetch_related(
+                Prefetch(
+                    "userpermissiongroupmembership_set",
+                    queryset=UserPermissionGroupMembership.objects.select_related(
+                        "ffadminuser"
+                    ),
+                )
+            )
+
+        return qs
+
+    def paginate_queryset(self, queryset: QuerySet) -> list[UserPermissionGroup] | None:
+        if self.action == "summaries":
+            return None
+        return super().paginate_queryset(queryset)
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return UserPermissionGroupSerializerDetail
+        elif self.action in ("my_groups", "summaries"):
+            return UserPermissionGroupSummarySerializer
+        return ListUserPermissionGroupSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if not getattr(self, "swagger_fake_view", False) and self.detail is True:
+            with suppress(ValueError):
+                context["group_admins"] = UserPermissionGroupMembership.objects.filter(
+                    userpermissiongroup__id=int(self.kwargs["pk"]), group_admin=True
+                ).values_list("ffadminuser__id", flat=True)
+        return context
 
     def perform_create(self, serializer):
         serializer.save(organisation_id=self.kwargs["organisation_pk"])
@@ -157,8 +237,12 @@ class UserPermissionGroupViewSet(viewsets.ModelViewSet):
         group = self.get_object()
         user_ids = request.data["user_ids"]
 
-        if request.user.id in user_ids and not request.user.is_organisation_admin(
-            Organisation.objects.get(pk=organisation_pk)
+        if (
+            isinstance(request.user, FFAdminUser)
+            and request.user.id in user_ids
+            and not request.user.is_organisation_admin(
+                Organisation.objects.get(pk=organisation_pk)
+            )
         ):
             raise PermissionDenied("Non-admin users cannot add themselves to a group.")
 
@@ -178,8 +262,12 @@ class UserPermissionGroupViewSet(viewsets.ModelViewSet):
         group = self.get_object()
         user_ids = request.data["user_ids"]
 
-        if request.user.id in user_ids and not request.user.is_organisation_admin(
-            Organisation.objects.get(pk=organisation_pk)
+        if (
+            isinstance(request.user, FFAdminUser)
+            and request.user.id in user_ids
+            and not request.user.is_organisation_admin(
+                Organisation.objects.get(pk=organisation_pk)
+            )
         ):
             raise PermissionDenied(
                 "Non-admin users cannot remove themselves from a group."
@@ -187,3 +275,47 @@ class UserPermissionGroupViewSet(viewsets.ModelViewSet):
 
         group.remove_users_by_id(user_ids)
         return Response(UserPermissionGroupSerializerDetail(instance=group).data)
+
+    @action(detail=False, methods=["GET"], url_path="my-groups")
+    def my_groups(self, request: Request, organisation_pk: int) -> Response:
+        """
+        Returns a list of summary group objects only for the groups a user is a member of.
+        """
+        return self.list(request, organisation_pk)
+
+    @action(detail=False, methods=["GET"])
+    def summaries(self, request: Request, organisation_pk: int) -> Response:
+        """
+        Returns a list of summary group objects for all groups in the organisation.
+        """
+        return self.list(request, organisation_pk)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, NestedIsOrganisationAdminPermission])
+def make_user_group_admin(
+    request: Request, organisation_pk: int, group_pk: int, user_pk: int
+) -> Response:
+    user = get_object_or_404(
+        FFAdminUser,
+        userorganisation__organisation_id=organisation_pk,
+        permission_groups__id=group_pk,
+        id=user_pk,
+    )
+    user.make_group_admin(group_pk)
+    return Response()
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, NestedIsOrganisationAdminPermission])
+def remove_user_as_group_admin(
+    request: Request, organisation_pk: int, group_pk: int, user_pk: int
+) -> Response:
+    user = get_object_or_404(
+        FFAdminUser,
+        userorganisation__organisation_id=organisation_pk,
+        permission_groups__id=group_pk,
+        id=user_pk,
+    )
+    user.remove_as_group_admin(group_pk)
+    return Response()

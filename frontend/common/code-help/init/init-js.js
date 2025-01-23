@@ -1,7 +1,12 @@
-module.exports = (envId, { LIB_NAME, FEATURE_NAME, FEATURE_FUNCTION, FEATURE_NAME_ALT, NPM_CLIENT }, customFeature) => `import ${LIB_NAME} from "${NPM_CLIENT}"; //Add this line if you're using ${LIB_NAME} via npm
+import Constants from 'common/constants'
+module.exports = (
+  envId,
+  { FEATURE_FUNCTION, FEATURE_NAME, FEATURE_NAME_ALT, LIB_NAME, NPM_CLIENT },
+  customFeature,
+) => `import ${LIB_NAME} from "${NPM_CLIENT}"; // Add this line if you're using ${LIB_NAME} via npm
 
 ${LIB_NAME}.init({
-    environmentID:"${envId}",
+    environmentID: "${envId}",${Constants.isCustomFlagsmithUrl() ? `\n    api: "${Constants.getFlagsmithSDKUrl()}",` : ''}
     onChange: (oldFlags, params) => { // Occurs whenever flags are changed
         // Determines if the update came from the server or local cached storage
         const { isFromServer } = params;
@@ -12,10 +17,14 @@ ${LIB_NAME}.init({
         }
 
         // Or, use the value of a feature
-        const ${FEATURE_NAME_ALT} = ${LIB_NAME}.getValue("${customFeature || FEATURE_NAME_ALT}");
+        const ${FEATURE_NAME_ALT} = ${LIB_NAME}.getValue("${
+  customFeature || FEATURE_NAME_ALT
+}");
 
         // Check whether value has changed
-        const ${FEATURE_NAME_ALT}Old = oldFlags["${customFeature || FEATURE_NAME_ALT}"]
+        const ${FEATURE_NAME_ALT}Old = oldFlags["${
+  customFeature || FEATURE_NAME_ALT
+}"]
         && oldFlags["${customFeature || FEATURE_NAME_ALT}"].value;
 
         if (${FEATURE_NAME_ALT} !== ${FEATURE_NAME_ALT}Old) {
@@ -23,4 +32,4 @@ ${LIB_NAME}.init({
         }
     }
 });
-`;
+`

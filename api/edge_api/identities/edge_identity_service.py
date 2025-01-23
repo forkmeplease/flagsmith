@@ -1,68 +1,55 @@
-import typing
+from environments.dynamodb import DynamoEnvironmentV2Wrapper
+from environments.dynamodb.types import (
+    IdentityOverridesV2List,
+    IdentityOverrideV2,
+)
 
-from django.db.models import Prefetch, Q
-from flag_engine.features.models import FeatureStateModel
-from flag_engine.identities.models import IdentityModel
-
-from environments.identities.models import Identity
-from environments.models import Environment
-from features.models import FeatureState
-from features.multivariate.models import MultivariateFeatureStateValue
+ddb_environment_v2_wrapper = DynamoEnvironmentV2Wrapper()
 
 
-def get_all_feature_states_for_edge_identity(
-    identity: IdentityModel,
-) -> typing.Tuple[
-    typing.List[typing.Union[FeatureState, FeatureStateModel]], typing.Set[str]
-]:
-    """
-    Get all feature states for a flag engine identity model. The list returned by
-    this function contains two distinct types: features.models.FeatureState &
-    flag_engine.features.models.FeatureStateModel.
-
-    :param identity: the IdentityModel to get the feature states for
-    :return: tuple of (list of feature states, set of feature names that were overridden
-        for the identity specifically)
-    """
-    segment_ids = Identity.dynamo_wrapper.get_segment_ids(identity_model=identity)
-    django_environment = Environment.objects.get(api_key=identity.environment_api_key)
-
-    q = Q(identity__isnull=True) & (
-        Q(feature_segment__segment__id__in=segment_ids)
-        | Q(feature_segment__isnull=True)
-    )
-    environment_and_segment_feature_states = (
-        django_environment.feature_states.select_related(
-            "feature",
-            "feature_segment",
-            "feature_segment__segment",
-            "feature_state_value",
+def get_edge_identity_overrides(
+    environment_id: int,
+    feature_id: int | None = None,
+) -> list[IdentityOverrideV2]:
+    override_items = (
+        ddb_environment_v2_wrapper.get_identity_overrides_by_environment_id(
+            environment_id=environment_id,
+            feature_id=feature_id,
         )
-        .prefetch_related(
-            Prefetch(
-                "multivariate_feature_state_values",
-                queryset=MultivariateFeatureStateValue.objects.select_related(
-                    "multivariate_feature_option"
-                ),
+    )
+    return [
+        IdentityOverrideV2.model_validate(
+            {**item, "environment_id": str(item["environment_id"])}
+        )
+        for item in override_items
+    ]
+
+
+def get_edge_identity_overrides_for_feature_ids(
+    environment_id: int,
+    feature_ids: None | list[int] = None,
+) -> list[IdentityOverridesV2List]:
+    query_responses = (
+        ddb_environment_v2_wrapper.get_identity_overrides_by_environment_id(
+            environment_id=environment_id,
+            feature_ids=feature_ids,
+        )
+    )
+
+    results = []
+    for identity_overrides_query_response in query_responses:
+        identity_overrides = [
+            IdentityOverrideV2.model_validate(
+                {**item, "environment_id": str(item["environment_id"])}
+            )
+            for item in identity_overrides_query_response.items
+        ]
+        complete = identity_overrides_query_response.is_num_identity_overrides_complete
+        results.append(
+            IdentityOverridesV2List(
+                identity_overrides=identity_overrides,
+                is_num_identity_overrides_complete=complete,
             )
         )
-        .filter(q)
-    )
 
-    feature_states = {}
-    for feature_state in environment_and_segment_feature_states:
-        feature_name = feature_state.feature.name
-        if (
-            feature_name not in feature_states
-            or feature_state > feature_states[feature_name]
-        ):
-            feature_states[feature_name] = feature_state
-
-    identity_feature_states = identity.identity_features
-    identity_feature_names = set()
-    for identity_feature_state in identity_feature_states:
-        feature_name = identity_feature_state.feature.name
-        feature_states[feature_name] = identity_feature_state
-        identity_feature_names.add(feature_name)
-
-    return list(feature_states.values()), identity_feature_names
+    return results

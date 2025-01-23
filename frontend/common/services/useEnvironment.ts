@@ -4,27 +4,80 @@ import { service } from 'common/service'
 
 export const environmentService = service
   .enhanceEndpoints({ addTagTypes: ['Environment'] })
-    .injectEndpoints({
-  endpoints: (builder) => ({
-
-    getEnvironments: builder.query<Res['environments'], Req['getEnvironments']>({
-      query: (data) => ({
-        url: `environments/?project=${data.projectId}`,
+  .injectEndpoints({
+    endpoints: (builder) => ({
+      getEnvironment: builder.query<Res['environment'], Req['getEnvironment']>({
+        providesTags: (res) => [{ id: res?.id, type: 'Environment' }],
+        query: (query: Req['getEnvironment']) => ({
+          url: `environments/${query.id}/`,
+        }),
       }),
-      providesTags:[{ type: 'Environment', id: 'LIST' },],
+      getEnvironments: builder.query<
+        Res['environments'],
+        Req['getEnvironments']
+      >({
+        providesTags: [{ id: 'LIST', type: 'Environment' }],
+        query: (data) => ({
+          url: `environments/?project=${data.projectId}`,
+        }),
+      }),
+      updateEnvironment: builder.mutation<
+        Res['environment'],
+        Req['updateEnvironment']
+      >({
+        invalidatesTags: (res) => [
+          { id: 'LIST', type: 'Environment' },
+          { id: res?.id, type: 'Environment' },
+        ],
+        query: (query: Req['updateEnvironment']) => ({
+          body: query.body,
+          method: 'PUT',
+          url: `environments/${query.id}/`,
+        }),
+      }),
+      // END OF ENDPOINTS
     }),
-    // END OF ENDPOINTS
-  }),
- })
+  })
 
-export async function getEnvironments(store: any, data: Req['getEnvironments'], options?: Parameters<typeof environmentService.endpoints.getEnvironments.initiate>[1]) {
-  store.dispatch(environmentService.endpoints.getEnvironments.initiate(data,options))
-  return Promise.all(store.dispatch(environmentService.util.getRunningQueriesThunk()))
+export async function getEnvironments(
+  store: any,
+  data: Req['getEnvironments'],
+  options?: Parameters<
+    typeof environmentService.endpoints.getEnvironments.initiate
+  >[1],
+) {
+  return store.dispatch(
+    environmentService.endpoints.getEnvironments.initiate(data, options),
+  )
 }
-  // END OF FUNCTION_EXPORTS
+export async function getEnvironment(
+  store: any,
+  data: Req['getEnvironment'],
+  options?: Parameters<
+    typeof environmentService.endpoints.getEnvironment.initiate
+  >[1],
+) {
+  return store.dispatch(
+    environmentService.endpoints.getEnvironment.initiate(data, options),
+  )
+}
+export async function updateEnvironment(
+  store: any,
+  data: Req['updateEnvironment'],
+  options?: Parameters<
+    typeof environmentService.endpoints.updateEnvironment.initiate
+  >[1],
+) {
+  return store.dispatch(
+    environmentService.endpoints.updateEnvironment.initiate(data, options),
+  )
+}
+// END OF FUNCTION_EXPORTS
 
 export const {
+  useGetEnvironmentQuery,
   useGetEnvironmentsQuery,
+  useUpdateEnvironmentMutation,
   // END OF EXPORTS
 } = environmentService
 

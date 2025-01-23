@@ -1,63 +1,51 @@
 import logging
 
-from core.permissions import HasMasterAPIKey
+from common.projects.permissions import VIEW_PROJECT
+from common.segments.serializers import SegmentSerializer
 from django.utils.decorators import method_decorator
-from drf_yasg2 import openapi
-from drf_yasg2.utils import swagger_auto_schema
+from drf_yasg.utils import swagger_auto_schema
 from rest_framework import viewsets
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import action, api_view
 from rest_framework.generics import get_object_or_404
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from app.pagination import CustomPagination
+from edge_api.identities.models import EdgeIdentity
 from environments.identities.models import Identity
+from environments.models import Environment
 from features.models import FeatureState
-from features.serializers import SegmentAssociatedFeatureStateSerializer
+from features.serializers import (
+    AssociatedFeaturesQuerySerializer,
+    SegmentAssociatedFeatureStateSerializer,
+)
+from features.versioning.models import EnvironmentFeatureVersion
 
 from .models import Segment
-from .permissions import MasterAPIKeySegmentPermissions, SegmentPermissions
-from .serializers import SegmentSerializer
+from .permissions import SegmentPermissions
+from .serializers import SegmentListQuerySerializer
 
 logger = logging.getLogger()
 
 
 @method_decorator(
     name="list",
-    decorator=swagger_auto_schema(
-        manual_parameters=[
-            openapi.Parameter(
-                "identity",
-                openapi.IN_QUERY,
-                "Optionally provide the id of an identity to get only the segments they match",
-                required=False,
-                type=openapi.TYPE_INTEGER,
-            ),
-            openapi.Parameter(
-                "q",
-                openapi.IN_QUERY,
-                "Search term to find segment with given term in their name",
-                required=False,
-                type=openapi.TYPE_STRING,
-            ),
-        ]
-    ),
+    decorator=swagger_auto_schema(query_serializer=SegmentListQuerySerializer()),
 )
 class SegmentViewSet(viewsets.ModelViewSet):
     serializer_class = SegmentSerializer
-    permission_classes = [SegmentPermissions | MasterAPIKeySegmentPermissions]
+    permission_classes = [SegmentPermissions]
     pagination_class = CustomPagination
 
     def get_queryset(self):
-        if hasattr(self.request, "master_api_key"):
-            permitted_projects = self.request.master_api_key.organisation.projects.all()
-        else:
-            permitted_projects = self.request.user.get_permitted_projects(
-                permissions=["VIEW_PROJECT"]
-            )
+        if getattr(self, "swagger_fake_view", False):
+            return Segment.objects.none()
+
+        permitted_projects = self.request.user.get_permitted_projects(
+            permission_key=VIEW_PROJECT
+        )
         project = get_object_or_404(permitted_projects, pk=self.kwargs["project_pk"])
 
-        queryset = project.segments.all()
+        queryset = Segment.live_objects.filter(project=project)
 
         if self.action == "list":
             # TODO: at the moment, the UI only shows the name and description of the segment in the list view.
@@ -68,23 +56,34 @@ class SegmentViewSet(viewsets.ModelViewSet):
                 "rules__rules",
                 "rules__rules__conditions",
                 "rules__rules__rules",
+                "metadata",
             )
 
-        identity_pk = self.request.query_params.get("identity")
+        query_serializer = SegmentListQuerySerializer(data=self.request.query_params)
+        query_serializer.is_valid(raise_exception=True)
+
+        identity_pk = query_serializer.validated_data.get("identity")
         if identity_pk:
             if identity_pk.isdigit():
                 identity = Identity.objects.get(pk=identity_pk)
                 segment_ids = [segment.id for segment in identity.get_segments()]
             else:
-                segment_ids = Identity.dynamo_wrapper.get_segment_ids(identity_pk)
+                segment_ids = EdgeIdentity.dynamo_wrapper.get_segment_ids(identity_pk)
             queryset = queryset.filter(id__in=segment_ids)
 
-        search_term = self.request.query_params.get("q")
+        search_term = query_serializer.validated_data.get("q")
         if search_term:
             queryset = queryset.filter(name__icontains=search_term)
 
+        include_feature_specific = query_serializer.validated_data[
+            "include_feature_specific"
+        ]
+        if include_feature_specific is False:
+            queryset = queryset.filter(feature__isnull=True)
+
         return queryset
 
+    @swagger_auto_schema(query_serializer=AssociatedFeaturesQuerySerializer())
     @action(
         detail=True,
         methods=["GET"],
@@ -93,7 +92,22 @@ class SegmentViewSet(viewsets.ModelViewSet):
     )
     def associated_features(self, request, *args, **kwargs):
         segment = self.get_object()
-        queryset = FeatureState.objects.filter(feature_segment__segment=segment)
+
+        query_serializer = AssociatedFeaturesQuerySerializer(data=request.query_params)
+        query_serializer.is_valid(raise_exception=True)
+
+        filter_kwargs = {"feature_segment__segment": segment}
+        if environment_id := query_serializer.validated_data.get("environment"):
+            environment = Environment.objects.get(pk=environment_id)
+            filter_kwargs["environment"] = environment
+            if environment.use_v2_feature_versioning:
+                filter_kwargs["environment_feature_version__in"] = (
+                    EnvironmentFeatureVersion.objects.get_latest_versions_by_environment_id(
+                        environment_id
+                    )
+                )
+
+        queryset = FeatureState.objects.filter(**filter_kwargs)
 
         page = self.paginate_queryset(queryset)
         if page is not None:
@@ -106,13 +120,9 @@ class SegmentViewSet(viewsets.ModelViewSet):
 
 @swagger_auto_schema(responses={200: SegmentSerializer()}, method="get")
 @api_view(["GET"])
-@permission_classes([IsAuthenticated | HasMasterAPIKey])
 def get_segment_by_uuid(request, uuid):
-    if getattr(request, "master_api_key", None):
-        accessible_projects = request.master_api_key.organisation.projects.all()
-    else:
-        accessible_projects = request.user.get_permitted_projects(["VIEW_PROJECT"])
-    qs = Segment.objects.filter(project__in=accessible_projects)
+    accessible_projects = request.user.get_permitted_projects(VIEW_PROJECT)
+    qs = Segment.live_objects.filter(project__in=accessible_projects)
     segment = get_object_or_404(qs, uuid=uuid)
     serializer = SegmentSerializer(instance=segment)
     return Response(serializer.data)

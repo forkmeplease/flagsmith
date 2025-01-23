@@ -1,23 +1,23 @@
-# -*- coding: utf-8 -*-
-from __future__ import unicode_literals
-
 import logging
 import typing
+import uuid
 from copy import deepcopy
 
-import boto3
 from core.models import abstract_base_auditable_model_factory
 from core.request_origin import RequestOrigin
 from django.conf import settings
+from django.contrib.contenttypes.fields import GenericRelation
 from django.core.cache import caches
 from django.db import models
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 from django.utils import timezone
-from django.utils.translation import ugettext_lazy as _
-from django_lifecycle import AFTER_CREATE, AFTER_SAVE, LifecycleModel, hook
-from flag_engine.api.document_builders import (
-    build_environment_api_key_document,
-    build_environment_document,
+from django_lifecycle import (
+    AFTER_CREATE,
+    AFTER_DELETE,
+    AFTER_SAVE,
+    AFTER_UPDATE,
+    LifecycleModel,
+    hook,
 )
 from rest_framework.request import Request
 from softdelete.models import SoftDeleteObject
@@ -32,43 +32,62 @@ from environments.api_keys import (
     generate_client_api_key,
     generate_server_api_key,
 )
-from environments.dynamodb import DynamoEnvironmentWrapper
+from environments.constants import IDENTITY_INTEGRATIONS_RELATION_NAMES
+from environments.dynamodb import (
+    DynamoEnvironmentAPIKeyWrapper,
+    DynamoEnvironmentV2Wrapper,
+    DynamoEnvironmentWrapper,
+)
 from environments.exceptions import EnvironmentHeaderNotPresentError
 from environments.managers import EnvironmentManager
 from features.models import Feature, FeatureSegment, FeatureState
+from features.multivariate.models import MultivariateFeatureStateValue
+from metadata.models import Metadata
 from projects.models import Project
 from segments.models import Segment
-from webhooks.models import AbstractBaseWebhookModel
+from util.mappers import map_environment_to_sdk_document
+from webhooks.models import AbstractBaseExportableWebhookModel
 
 logger = logging.getLogger(__name__)
 
-environment_cache = caches[settings.ENVIRONMENT_CACHE_LOCATION]
+environment_cache = caches[settings.ENVIRONMENT_CACHE_NAME]
 environment_document_cache = caches[settings.ENVIRONMENT_DOCUMENT_CACHE_LOCATION]
 environment_segments_cache = caches[settings.ENVIRONMENT_SEGMENTS_CACHE_NAME]
+bad_environments_cache = caches[settings.BAD_ENVIRONMENTS_CACHE_LOCATION]
 
-# Intialize the dynamo environment wrapper globaly
+# Intialize the dynamo environment wrapper(s) globaly
 environment_wrapper = DynamoEnvironmentWrapper()
+environment_v2_wrapper = DynamoEnvironmentV2Wrapper()
+environment_api_key_wrapper = DynamoEnvironmentAPIKeyWrapper()
 
 
 class Environment(
-    LifecycleModel, abstract_base_auditable_model_factory(), SoftDeleteObject
+    LifecycleModel,
+    abstract_base_auditable_model_factory(
+        change_details_excluded_fields=["updated_at"],
+        historical_records_excluded_fields=["uuid"],
+    ),
+    SoftDeleteObject,
 ):
     history_record_class_path = "environments.models.HistoricalEnvironment"
     related_object_type = RelatedObjectType.ENVIRONMENT
 
     name = models.CharField(max_length=2000)
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     created_date = models.DateTimeField("DateCreated", auto_now_add=True)
     description = models.TextField(null=True, blank=True, max_length=20000)
     project = models.ForeignKey(
-        Project,
+        "projects.Project",
         related_name="environments",
-        help_text=_(
-            "Changing the project selected will remove all previous Feature States for the "
-            "previously associated projects Features that are related to this Environment. New "
-            "default Feature States will be created for the new selected projects Features for "
-            "this Environment."
+        help_text=(
+            "Changing the project selected will remove all previous Feature States for"
+            " the previously associated projects Features that are related to this"
+            " Environment. New default Feature States will be created for the new"
+            " selected projects Features for this Environment."
         ),
-        on_delete=models.CASCADE,
+        # Cascade deletes are decouple from the Django ORM. See this PR for details.
+        # https://github.com/Flagsmith/flagsmith/pull/3360/
+        on_delete=models.DO_NOTHING,
     )
 
     api_key = models.CharField(
@@ -91,12 +110,38 @@ class Environment(
     banner_colour = models.CharField(
         null=True, blank=True, max_length=7, help_text="hex code for the banner colour"
     )
+    metadata = GenericRelation(Metadata)
 
     hide_disabled_flags = models.BooleanField(
         null=True,
         blank=True,
-        help_text="If true will exclude flags from SDK which are "
-        "disabled. NOTE: If set, this will override the project `hide_disabled_flags`",
+        help_text=(
+            "If true will exclude flags from SDK which are disabled. NOTE: If set, this"
+            " will override the project `hide_disabled_flags`"
+        ),
+    )
+    use_identity_composite_key_for_hashing = models.BooleanField(
+        default=True,
+        help_text=(
+            "Enable this to have consistent multivariate and percentage split evaluations "
+            "across all SDKs (in local and server side mode)"
+        ),
+        db_column="use_mv_v2_evaluation",  # see https://github.com/Flagsmith/flagsmith/issues/2186
+    )
+    hide_sensitive_data = models.BooleanField(
+        default=False,
+        help_text="If true, will hide sensitive data(e.g: traits, description etc) from the SDK endpoints",
+    )
+
+    use_v2_feature_versioning = models.BooleanField(default=False)
+    use_identity_overrides_in_local_eval = models.BooleanField(
+        default=True,
+        help_text="When enabled, identity overrides will be included in the environment document",
+    )
+
+    is_creating = models.BooleanField(
+        default=False,
+        help_text="Attribute used to indicate when an environment is still being created (via clone for example)",
     )
 
     objects = EnvironmentManager()
@@ -106,16 +151,19 @@ class Environment(
 
     @hook(AFTER_CREATE)
     def create_feature_states(self):
-        features = self.project.features.all()
-        for feature in features:
-            FeatureState.objects.create(
-                feature=feature,
-                environment=self,
-                identity=None,
-                enabled=False
-                if self.project.prevent_flag_defaults
-                else feature.default_enabled,
-            )
+        FeatureState.create_initial_feature_states_for_environment(environment=self)
+
+    @hook(AFTER_UPDATE)
+    def clear_environment_cache(self):
+        # TODO: this could rebuild the cache itself (using an async task)
+        environment_cache.delete(self.initial_value("api_key"))
+
+    @hook(AFTER_DELETE)
+    def delete_from_dynamo(self):
+        if self.project.enable_dynamo_db and environment_wrapper.is_enabled:
+            from environments.tasks import delete_environment_from_dynamo
+
+            delete_environment_from_dynamo.delay(args=(self.api_key, self.id))
 
     def __str__(self):
         return "Project %s - Environment %s" % (self.project.name, self.name)
@@ -123,7 +171,9 @@ class Environment(
     def natural_key(self):
         return (self.api_key,)
 
-    def clone(self, name: str, api_key: str = None) -> "Environment":
+    def clone(
+        self, name: str, api_key: str = None, clone_feature_states_async: bool = False
+    ) -> "Environment":
         """
         Creates a clone of the environment, related objects and returns the
         cloned object after saving it to the database.
@@ -131,17 +181,20 @@ class Environment(
         """
         clone = deepcopy(self)
         clone.id = None
+        clone.uuid = uuid.uuid4()
         clone.name = name
         clone.api_key = api_key if api_key else create_hash()
+        clone.is_creating = True
         clone.save()
-        for feature_segment in self.feature_segments.all():
-            feature_segment.clone(clone)
 
-        # Since identities are closely tied to the enviroment
-        # it does not make much sense to clone them, hence
-        # only clone feature states without identities
-        for feature_state in self.feature_states.filter(identity=None):
-            feature_state.clone(clone, live_from=feature_state.live_from)
+        from environments.tasks import clone_environment_feature_states
+
+        kwargs = {"source_environment_id": self.id, "clone_environment_id": clone.id}
+
+        if clone_feature_states_async:
+            clone_environment_feature_states.delay(kwargs=kwargs)
+        else:
+            clone_environment_feature_states(**kwargs)
 
         return clone
 
@@ -163,43 +216,66 @@ class Environment(
                 logger.warning("Requested environment with null api_key.")
                 return None
 
+            if cls.is_bad_key(api_key):
+                return None
+
             environment = environment_cache.get(api_key)
             if not environment:
                 select_related_args = (
                     "project",
                     "project__organisation",
-                    "mixpanel_config",
-                    "segment_config",
-                    "amplitude_config",
-                    "heap_config",
-                    "dynatrace_config",
+                    *IDENTITY_INTEGRATIONS_RELATION_NAMES,
                 )
-                environment = (
-                    cls.objects.select_related(*select_related_args)
-                    .filter(Q(api_key=api_key) | Q(api_keys__key=api_key))
-                    .distinct()
-                    .defer("description")
-                    .get()
+                base_qs = cls.objects.select_related(*select_related_args).defer(
+                    "description"
                 )
-                environment_cache.set(api_key, environment, timeout=60)
+                qs_for_embedded_api_key = base_qs.filter(api_key=api_key)
+                qs_for_fk_api_key = base_qs.filter(api_keys__key=api_key)
+
+                environment = qs_for_embedded_api_key.union(qs_for_fk_api_key).get()
+                environment_cache.set(
+                    api_key, environment, timeout=settings.ENVIRONMENT_CACHE_SECONDS
+                )
             return environment
         except cls.DoesNotExist:
+            cls.set_bad_key(api_key)
             logger.info("Environment with api_key %s does not exist" % api_key)
 
     @classmethod
-    def write_environments_to_dynamodb(cls, environments_filter: Q) -> None:
+    def write_environments_to_dynamodb(
+        cls, environment_id: int = None, project_id: int = None
+    ) -> None:
         # use a list to make sure the entire qs is evaluated up front
-        environments = list(
-            Environment.objects.filter_for_document_builder(environments_filter)
+        environments_filter = (
+            Q(id=environment_id) if environment_id else Q(project_id=project_id)
         )
-
+        environments = list(
+            cls.objects.filter_for_document_builder(
+                environments_filter,
+                extra_select_related=IDENTITY_INTEGRATIONS_RELATION_NAMES,
+                extra_prefetch_related=[
+                    Prefetch(
+                        "feature_states",
+                        queryset=FeatureState.objects.select_related(
+                            "feature", "feature_state_value"
+                        ),
+                    ),
+                    Prefetch(
+                        "feature_states__multivariate_feature_state_values",
+                        queryset=MultivariateFeatureStateValue.objects.select_related(
+                            "multivariate_feature_option"
+                        ),
+                    ),
+                ],
+            )
+        )
         if not environments:
             return
 
         # grab the first project and verify that each environment is for the same
         # project (which should always be the case). Since we're working with fairly
         # small querysets here, this shouldn't have a noticeable impact on performance.
-        project = getattr(environments[0], "project", None)
+        project: Project | None = getattr(environments[0], "project", None)
         for environment in environments[1:]:
             if not environment.project == project:
                 raise RuntimeError("Environments must all belong to the same project.")
@@ -208,6 +284,9 @@ class Environment(
             return
 
         environment_wrapper.write_environments(environments)
+
+        if project.edge_v2_environments_migrated and environment_v2_wrapper.is_enabled:
+            environment_v2_wrapper.write_environments(environments)
 
     def get_feature_state(
         self, feature_id: int, filter_kwargs: dict = None
@@ -228,6 +307,24 @@ class Environment(
             )
         )
 
+    @staticmethod
+    def is_bad_key(environment_key: str) -> bool:
+        return (
+            settings.CACHE_BAD_ENVIRONMENTS_SECONDS > 0
+            and bad_environments_cache.get(environment_key, 0)
+            >= settings.CACHE_BAD_ENVIRONMENTS_AFTER_FAILURES
+        )
+
+    @staticmethod
+    def set_bad_key(environment_key: str) -> None:
+        if settings.CACHE_BAD_ENVIRONMENTS_SECONDS:
+            current_count = bad_environments_cache.get(environment_key, 0)
+            bad_environments_cache.set(
+                environment_key,
+                current_count + 1,
+                timeout=settings.CACHE_BAD_ENVIRONMENTS_SECONDS,
+            )
+
     def trait_persistence_allowed(self, request: Request) -> bool:
         return (
             self.allow_client_traits
@@ -242,7 +339,7 @@ class Environment(
         segments = environment_segments_cache.get(self.id)
         if not segments:
             segments = list(
-                Segment.objects.filter(
+                Segment.live_objects.filter(
                     feature_segments__feature_states__environment=self
                 ).prefetch_related(
                     "rules",
@@ -256,7 +353,10 @@ class Environment(
         return segments
 
     @classmethod
-    def get_environment_document(cls, api_key: str) -> dict:
+    def get_environment_document(
+        cls,
+        api_key: str,
+    ) -> dict[str, typing.Any]:
         if settings.CACHE_ENVIRONMENT_DOCUMENT_SECONDS > 0:
             return cls._get_environment_document_from_cache(api_key)
         return cls._get_environment_document_from_db(api_key)
@@ -274,7 +374,10 @@ class Environment(
         return self.project.hide_disabled_flags
 
     @classmethod
-    def _get_environment_document_from_cache(cls, api_key: str) -> dict:
+    def _get_environment_document_from_cache(
+        cls,
+        api_key: str,
+    ) -> dict[str, typing.Any]:
         environment_document = environment_document_cache.get(api_key)
         if not environment_document:
             environment_document = cls._get_environment_document_from_db(api_key)
@@ -282,9 +385,44 @@ class Environment(
         return environment_document
 
     @classmethod
-    def _get_environment_document_from_db(cls, api_key: str) -> dict:
-        environment = cls.objects.filter_for_document_builder(api_key=api_key).get()
-        return build_environment_document(environment)
+    def _get_environment_document_from_db(
+        cls,
+        api_key: str,
+    ) -> dict[str, typing.Any]:
+        environment = cls.objects.filter_for_document_builder(
+            api_key=api_key,
+            extra_prefetch_related=[
+                Prefetch(
+                    "feature_states",
+                    queryset=FeatureState.objects.select_related(
+                        "feature",
+                        "feature_state_value",
+                        "identity",
+                        "identity__environment",
+                    ).prefetch_related(
+                        Prefetch(
+                            "identity__identity_features",
+                            queryset=FeatureState.objects.select_related(
+                                "feature", "feature_state_value", "environment"
+                            ),
+                        ),
+                        Prefetch(
+                            "identity__identity_features__multivariate_feature_state_values",
+                            queryset=MultivariateFeatureStateValue.objects.select_related(
+                                "multivariate_feature_option"
+                            ),
+                        ),
+                    ),
+                ),
+                Prefetch(
+                    "feature_states__multivariate_feature_state_values",
+                    queryset=MultivariateFeatureStateValue.objects.select_related(
+                        "multivariate_feature_option"
+                    ),
+                ),
+            ],
+        ).get()
+        return map_environment_to_sdk_document(environment)
 
     def _get_environment(self):
         return self
@@ -293,7 +431,7 @@ class Environment(
         return self.project
 
 
-class Webhook(AbstractBaseWebhookModel):
+class Webhook(AbstractBaseExportableWebhookModel):
     environment = models.ForeignKey(
         Environment, on_delete=models.CASCADE, related_name="webhooks"
     )
@@ -356,13 +494,6 @@ class Webhook(AbstractBaseWebhookModel):
         return data
 
 
-dynamo_api_key_table = None
-if settings.ENVIRONMENTS_API_KEY_TABLE_NAME_DYNAMO:
-    dynamo_api_key_table = boto3.resource("dynamodb").Table(
-        settings.ENVIRONMENTS_API_KEY_TABLE_NAME_DYNAMO
-    )
-
-
 class EnvironmentAPIKey(LifecycleModel):
     """
     These API keys are only currently used for server side integrations.
@@ -384,9 +515,17 @@ class EnvironmentAPIKey(LifecycleModel):
     def is_valid(self) -> bool:
         return self.active and (not self.expires_at or self.expires_at > timezone.now())
 
-    @hook(AFTER_SAVE)
+    @hook(AFTER_SAVE, when="_should_update_dynamo", is_now=True)
     def send_to_dynamo(self):
-        if not dynamo_api_key_table:
-            return
-        env_key_dict = build_environment_api_key_document(self)
-        dynamo_api_key_table.put_item(Item=env_key_dict)
+        environment_api_key_wrapper.write_api_key(self)
+
+    @hook(AFTER_DELETE, when="_should_update_dynamo", is_now=True)
+    def delete_from_dynamo(self):
+        environment_api_key_wrapper.delete_api_key(self.key)
+
+    @property
+    def _should_update_dynamo(self) -> bool:
+        return (
+            self.environment.project.enable_dynamo_db
+            and environment_api_key_wrapper.is_enabled
+        )

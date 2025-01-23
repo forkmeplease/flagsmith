@@ -1,19 +1,30 @@
 import typing
+from functools import cached_property
 from importlib import import_module
 
 from django.db import models
 from django.db.models import Model, Q
-from django_lifecycle import AFTER_SAVE, BEFORE_CREATE, LifecycleModel, hook
+from django.utils import timezone
+from django_lifecycle import (
+    AFTER_CREATE,
+    BEFORE_CREATE,
+    LifecycleModel,
+    hook,
+    priority,
+)
 
 from api_keys.models import MasterAPIKey
 from audit.related_object_type import RelatedObjectType
 from projects.models import Project
 
+if typing.TYPE_CHECKING:
+    from organisations.models import Organisation
+
 RELATED_OBJECT_TYPES = ((tag.name, tag.value) for tag in RelatedObjectType)
 
 
 class AuditLog(LifecycleModel):
-    created_date = models.DateTimeField("DateCreated", auto_now_add=True)
+    created_date = models.DateTimeField("DateCreated")
 
     project = models.ForeignKey(
         Project, related_name="audit_logs", null=True, on_delete=models.DO_NOTHING
@@ -42,12 +53,14 @@ class AuditLog(LifecycleModel):
     )
     related_object_id = models.IntegerField(null=True)
     related_object_type = models.CharField(max_length=20, null=True)
+    related_object_uuid = models.CharField(max_length=36, null=True)
 
-    skip_signals = models.CharField(
+    skip_signals_and_hooks = models.CharField(
         null=True,
         blank=True,
-        help_text="comma separated list of signal functions to skip",
+        help_text="comma separated list of signal/hooks functions/methods to skip",
         max_length=500,
+        db_column="skip_signals",
     )
     is_system_event = models.BooleanField(default=False)
 
@@ -59,9 +72,53 @@ class AuditLog(LifecycleModel):
         ordering = ("-created_date",)
 
     @property
-    def history_record(self):
+    def organisation(self) -> "Organisation | None":
+        # TODO properly implement organisation relation
+        # maybe the relation list should not be _that_ exhaustive...
+        for relation in (
+            "project",
+            "environment",
+            "author",
+            "master_api_key",
+            "history_record",
+        ):
+            if hasattr(related_instance := getattr(self, relation), "organisation"):
+                return related_instance.organisation
+        return None
+
+    @property
+    def environment_document_updated(self) -> bool:
+        if self.related_object_type == RelatedObjectType.CHANGE_REQUEST.name:
+            return False
+        skip_signals_and_hooks = (
+            self.skip_signals_and_hooks.split(",")
+            if self.skip_signals_and_hooks
+            else []
+        )
+        return "send_environments_to_dynamodb" not in skip_signals_and_hooks
+
+    @cached_property
+    def history_record(self) -> typing.Optional[Model]:
+        if not (self.history_record_class_path and self.history_record_id):
+            # There are still AuditLog records that will not have this detail
+            # for example, audit log records which are created when segment
+            # override priorities are changed.
+            return
+
         klass = self.get_history_record_model_class(self.history_record_class_path)
-        return klass.objects.get(id=self.history_record_id)
+        return klass.objects.filter(history_id=self.history_record_id).first()
+
+    @property
+    def project_name(self) -> str:
+        return getattr(self.project, "name", "unknown")
+
+    @property
+    def environment_name(self) -> str:
+        return getattr(self.environment, "name", "unknown")
+
+    @property
+    def author_identifier(self) -> str:
+        return getattr(self.author, "email", "system")
 
     @staticmethod
     def get_history_record_model_class(
@@ -71,27 +128,41 @@ class AuditLog(LifecycleModel):
         module = import_module(module_path)
         return getattr(module, class_name)
 
-    @hook(AFTER_SAVE)
-    def update_environments_updated_at(self):
-        # Don't update the environments updated_at if the audit log
-        # is of CHANGE_REQUEST type (since they don't (directly) impact
-        # the value of a given feature in an environment) or ENVIRONMENT
-        # since the environment itself has no impact on the feature states
-        # within it
-        if self.related_object_type == RelatedObjectType.CHANGE_REQUEST.name:
+    @hook(BEFORE_CREATE)
+    def add_project(self):
+        if self.environment and self.project is None:
+            self.project = self.environment.project
+
+    @hook(BEFORE_CREATE)
+    def add_created_date(self) -> None:
+        if not self.created_date:
+            self.created_date = timezone.now()
+
+    @hook(
+        AFTER_CREATE,
+        priority=priority.HIGHEST_PRIORITY,
+        when="environment_document_updated",
+        is_now=True,
+    )
+    def process_environment_update(self) -> None:
+        if not self.project:
             return
+
+        from environments.models import Environment
+        from environments.tasks import process_environment_update
 
         environments_filter = Q()
         if self.environment_id:
             environments_filter = Q(id=self.environment_id)
 
-        # Use a queryset to perform update to prevent signals being called at this point.
-        # Since we're re-saving the environment, we don't want to duplicate signals.
-        self.project.environments.filter(environments_filter).update(
-            updated_at=self.created_date
-        )
+        environment_ids = self.project.environments.filter(
+            environments_filter
+        ).values_list("id", flat=True)
 
-    @hook(BEFORE_CREATE)
-    def add_project(self):
-        if self.environment and self.project is None:
-            self.project = self.environment.project
+        # Update environment individually to avoid deadlock
+        for environment_id in environment_ids:
+            Environment.objects.filter(id=environment_id).update(
+                updated_at=self.created_date
+            )
+
+        process_environment_update.delay(args=(self.id,))

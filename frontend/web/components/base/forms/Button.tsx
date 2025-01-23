@@ -1,44 +1,125 @@
-import React, {FC, HTMLAttributeAnchorTarget} from 'react';
+import cn from 'classnames'
+import { ButtonHTMLAttributes, FC, HTMLAttributeAnchorTarget } from 'react'
+import Icon, { IconName } from 'components/Icon'
+import Constants from 'common/constants'
+import Utils, { PaidFeature } from 'common/utils/utils'
+import PlanBasedBanner from 'components/PlanBasedAccess'
 
-export type ButtonType = React.ButtonHTMLAttributes<HTMLButtonElement>
-export type ButtonLinkType = ButtonType & {
-    href?: string
-    target?: HTMLAttributeAnchorTarget
+export const themeClassNames = {
+  danger: 'btn btn-danger',
+  icon: 'btn-icon',
+  outline: 'btn--outline',
+  primary: 'btn-primary',
+  project: 'btn-project',
+  secondary: 'btn btn-secondary',
+  tertiary: 'btn-tertiary',
+  text: 'btn-link',
 }
 
-const Button: FC<ButtonType> = (props) => {
-    return (
-        <button
-             {...props}
-            className={`btn ${props.className || ''}`}
-        >
-            {props.children}
-        </button>
-    )
+export const sizeClassNames = {
+  default: '',
+  large: 'btn-lg',
+  small: 'btn-sm',
+  xSmall: 'btn-xsm',
 }
 
-export default Button;
-
-export const ButtonOutline: FC<ButtonType> = (props) => {
-    return (
-        <Button {...props} className={`btn--outline ${props.className || ''}`}/>
-    )
+export type ButtonType = ButtonHTMLAttributes<HTMLButtonElement> & {
+  iconRight?: IconName
+  iconRightColour?: keyof typeof Constants.colours
+  iconLeftColour?: keyof typeof Constants.colours
+  iconLeft?: IconName
+  href?: string
+  feature?: PaidFeature
+  target?: HTMLAttributeAnchorTarget
+  theme?: keyof typeof themeClassNames
+  size?: keyof typeof sizeClassNames
+  iconSize?: number
 }
 
-export const ButtonProject: FC<ButtonType> = (props) => {
-    return (
-        <Button {...props} className={`btn--project ${props.className || ''}`}/>
-    )
+export const Button: FC<ButtonType> = ({
+  children,
+  className,
+  feature,
+  href,
+  iconLeft,
+  iconLeftColour,
+  iconRight,
+  iconRightColour,
+  iconSize = 24,
+  onMouseUp,
+  size = 'default',
+  target,
+  theme = 'primary',
+  type = 'button',
+  ...rest
+}) => {
+  const hasPlan = feature ? Utils.getPlansPermission(feature) : true
+  return href || !hasPlan ? (
+    <a
+      onClick={!hasPlan ? undefined : (rest.onClick as React.MouseEventHandler)}
+      className={cn(className, themeClassNames[theme], sizeClassNames[size])}
+      target={!hasPlan ? '_blank' : target}
+      href={hasPlan ? href : Constants.getUpgradeUrl()}
+      rel='noreferrer'
+    >
+      <div className='d-flex h-100 align-items-center justify-content-center gap-2'>
+        {!!iconLeft && !!hasPlan && (
+          <Icon
+            fill={
+              iconLeftColour ? Constants.colours[iconLeftColour] : undefined
+            }
+            name={iconLeft}
+            width={iconSize}
+          />
+        )}
+        {children}
+        {!hasPlan && <PlanBasedBanner feature={feature} theme={'badge'} />}
+      </div>
+      {!!iconRight && (
+        <Icon
+          fill={
+            iconRightColour ? Constants.colours[iconRightColour] : undefined
+          }
+          className='ml-2'
+          name={iconRight}
+          width={iconSize}
+        />
+      )}
+    </a>
+  ) : (
+    <button
+      {...rest}
+      type={type}
+      onMouseUp={onMouseUp}
+      className={cn(
+        { btn: true },
+        className,
+        themeClassNames[theme],
+        sizeClassNames[size],
+      )}
+    >
+      {!!iconLeft && (
+        <Icon
+          fill={iconLeftColour ? Constants.colours[iconLeftColour] : undefined}
+          className='mr-2'
+          name={iconLeft}
+          width={iconSize}
+        />
+      )}
+      {children}
+      {!!iconRight && (
+        <Icon
+          fill={
+            iconRightColour ? Constants.colours[iconRightColour] : undefined
+          }
+          className='ml-2'
+          name={iconRight}
+          width={iconSize}
+        />
+      )}
+    </button>
+  )
 }
 
-export const ButtonLink: FC<ButtonLinkType> = ({href, className, target, children,...rest}) => {
-    return (
-        <Button {...rest} className={`btn--link ${className || ''}`}>
-            {href ? (
-                <a className="btn--link" target={target} href={href}>{children}</a>
-            ) : (
-                <span className="btn--link">{children}</span>
-            )}
-        </Button>
-    )
-}
+Button.displayName = 'Button'
+export default Button

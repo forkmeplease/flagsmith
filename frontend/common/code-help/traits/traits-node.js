@@ -1,10 +1,18 @@
-module.exports = (envId, { TRAIT_NAME, USER_ID }) => `const Flagsmith = require('flagsmith-nodejs');
+import Constants from 'common/constants'
 
-const flagsmith = new Flagsmith(
+module.exports = (
+  envId,
+  { FEATURE_NAME, TRAIT_NAME, LIB_NAME, NPM_NODE_CLIENT, USER_ID },
+  userId,
+) => `import Flagsmith from "${NPM_NODE_CLIENT}"; // Add this line if you're using ${LIB_NAME} via npm
+
+const ${LIB_NAME} = new Flagsmith({${
+  Constants.isCustomFlagsmithUrl() &&
+  `\n    apiUrl: '${Constants.getFlagsmithSDKUrl()}',`
+}
     environmentKey: '${envId}'
-);
-
+});
 // Identify a user, set their traits and retrieve the flags
 const traits = { ${TRAIT_NAME}: 'robin_reliant' };
 const flags = await flagsmith.getIdentityFlags('${USER_ID}', traits);
-`;
+`

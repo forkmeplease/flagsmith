@@ -8,8 +8,9 @@ from tempfile import TemporaryFile
 import boto3
 from django.core import serializers
 from django.core.serializers.json import DjangoJSONEncoder
-from django.db.models import Model, Q
+from django.db.models import F, Model, Q
 
+from edge_api.identities.export import export_edge_identity_and_overrides
 from environments.identities.models import Identity
 from environments.identities.traits.models import Trait
 from environments.models import Environment, EnvironmentAPIKey, Webhook
@@ -23,6 +24,7 @@ from features.multivariate.models import (
     MultivariateFeatureOption,
     MultivariateFeatureStateValue,
 )
+from features.versioning.models import EnvironmentFeatureVersion
 from integrations.datadog.models import DataDogConfiguration
 from integrations.heap.models import HeapConfiguration
 from integrations.mixpanel.models import MixpanelConfiguration
@@ -31,6 +33,12 @@ from integrations.rudderstack.models import RudderstackConfiguration
 from integrations.segment.models import SegmentConfiguration
 from integrations.slack.models import SlackConfiguration, SlackEnvironment
 from integrations.webhook.models import WebhookConfiguration
+from metadata.models import (
+    Metadata,
+    MetadataField,
+    MetadataModelField,
+    MetadataModelFieldRequirement,
+)
 from organisations.invites.models import InviteLink
 from organisations.models import (
     Organisation,
@@ -68,6 +76,8 @@ def full_export(organisation_id: int) -> typing.List[dict]:
         *export_environments(organisation_id),
         *export_identities(organisation_id),
         *export_features(organisation_id),
+        *export_metadata(organisation_id),
+        *export_edge_identities(organisation_id),
     ]
 
 
@@ -83,21 +93,51 @@ def export_organisation(organisation_id: int) -> typing.List[dict]:
     )
 
 
+def export_metadata(organisation_id: int) -> typing.List[dict]:
+    return _export_entities(
+        _EntityExportConfig(MetadataField, Q(organisation__id=organisation_id)),
+        _EntityExportConfig(
+            MetadataModelField, Q(field__organisation__id=organisation_id)
+        ),
+        _EntityExportConfig(
+            MetadataModelFieldRequirement,
+            Q(model_field__field__organisation__id=organisation_id),
+        ),
+        _EntityExportConfig(
+            Metadata, Q(model_field__field__organisation__id=organisation_id)
+        ),
+    )
+
+
 def export_projects(organisation_id: int) -> typing.List[dict]:
     default_filter = Q(project__organisation__id=organisation_id)
 
     return _export_entities(
         _EntityExportConfig(Project, Q(organisation__id=organisation_id)),
-        _EntityExportConfig(Segment, default_filter),
+        _EntityExportConfig(
+            Segment, Q(project__organisation__id=organisation_id, id=F("version_of"))
+        ),
         _EntityExportConfig(
             SegmentRule,
-            Q(segment__project__organisation__id=organisation_id)
-            | Q(rule__segment__project__organisation__id=organisation_id),
+            Q(
+                segment__project__organisation__id=organisation_id,
+                segment_id=F("segment__version_of"),
+            )
+            | Q(
+                rule__segment__project__organisation__id=organisation_id,
+                rule__segment_id=F("rule__segment__version_of"),
+            ),
         ),
         _EntityExportConfig(
             Condition,
-            Q(rule__segment__project__organisation__id=organisation_id)
-            | Q(rule__rule__segment__project__organisation__id=organisation_id),
+            Q(
+                rule__segment__project__organisation__id=organisation_id,
+                rule__segment_id=F("rule__segment__version_of"),
+            )
+            | Q(
+                rule__rule__segment__project__organisation__id=organisation_id,
+                rule__rule__segment_id=F("rule__rule__segment__version_of"),
+            ),
         ),
         _EntityExportConfig(Tag, default_filter),
         _EntityExportConfig(DataDogConfiguration, default_filter),
@@ -126,12 +166,20 @@ def export_identities(organisation_id: int) -> typing.List[dict]:
     traits = _export_entities(
         _EntityExportConfig(
             Trait,
-            Q(identity__environment__project__organisation__id=organisation_id),
+            Q(
+                identity__environment__project__organisation__id=organisation_id,
+                identity__environment__project__enable_dynamo_db=False,
+            ),
         ),
     )
+
     identities = _export_entities(
         _EntityExportConfig(
-            Identity, Q(environment__project__organisation__id=organisation_id)
+            Identity,
+            Q(
+                environment__project__organisation__id=organisation_id,
+                environment__project__enable_dynamo_db=False,
+            ),
         ),
     )
 
@@ -142,9 +190,26 @@ def export_identities(organisation_id: int) -> typing.List[dict]:
     return [*identities, *traits]
 
 
+def export_edge_identities(organisation_id: int) -> typing.List[dict]:
+    identities = []
+    traits = []
+    identity_overrides = []
+    for environment in Environment.objects.filter(
+        project__organisation__id=organisation_id, project__enable_dynamo_db=True
+    ):
+        exported_identities, exported_traits, exported_overrides = (
+            export_edge_identity_and_overrides(environment.api_key)
+        )
+        identities.extend(exported_identities)
+        traits.extend(exported_traits)
+        identity_overrides.extend(exported_overrides)
+
+    return [*identities, *traits, *identity_overrides]
+
+
 def export_features(organisation_id: int) -> typing.List[dict]:
     """
-    Export all features and related entities (including ChangeRequests)
+    Export all features and related entities, except ChangeRequests.
     """
 
     feature_states = []
@@ -164,7 +229,12 @@ def export_features(organisation_id: int) -> typing.List[dict]:
             _EntityExportConfig(
                 Feature,
                 Q(project__organisation__id=organisation_id),
-                exclude_fields=["owners"],
+                exclude_fields=["owners", "group_owners"],
+            ),
+            _EntityExportConfig(
+                EnvironmentFeatureVersion,
+                Q(feature__project__organisation__id=organisation_id),
+                exclude_fields=["created_by", "published_by"],
             ),
             _EntityExportConfig(
                 MultivariateFeatureOption,

@@ -20,6 +20,10 @@
             "essential": true,
             "environment": [
                 {
+                    "name": "LOG_LEVEL",
+                    "value": "INFO"
+                },
+                {
                     "name": "AWS_REGION",
                     "value": "eu-west-2"
                 },
@@ -72,8 +76,12 @@
                     "value": "flagsmith_environments"
                 },
                 {
-                    "name": "FE_E2E_TEST_USER_EMAIL",
-                    "value": "nightwatch@solidstategroup.com"
+                    "name": "ENVIRONMENTS_V2_TABLE_NAME_DYNAMO",
+                    "value": "flagsmith_environments_v2"
+                },
+                {
+                    "name": "ENABLE_FE_E2E",
+                    "value": "True"
                 },
                 {
                     "name": "GITHUB_CLIENT_ID",
@@ -90,18 +98,6 @@
                 {
                     "name": "IDENTITIES_TABLE_NAME_DYNAMO",
                     "value": "flagsmith_identities"
-                },
-                {
-                    "name": "INFLUXDB_BUCKET",
-                    "value": "api_staging"
-                },
-                {
-                    "name": "INFLUXDB_ORG",
-                    "value": "ben.rometsch@bullet-train.io"
-                },
-                {
-                    "name": "INFLUXDB_URL",
-                    "value": "https://eu-central-1-1.aws.cloud2.influxdata.com"
                 },
                 {
                     "name": "OAUTH_CLIENT_ID",
@@ -128,10 +124,6 @@
                     "value": "937916178726.2904626318658"
                 },
                 {
-                    "name":"EDGE_API_URL",
-                    "value":"https://edge.bullet-train-staging.win/api/v1/"
-                },
-                {
                     "name": "IDENTITY_MIGRATION_EVENT_BUS_NAME",
                     "value": "identity_migration-fb41b5d"
                 },
@@ -140,8 +132,8 @@
                     "value": "flagsmith_environment_api_key"
                 },
                 {
-                    "name":"EDGE_RELEASE_DATETIME",
-                    "value":"2022-05-18T09:45:00Z"
+                    "name": "EDGE_RELEASE_DATETIME",
+                    "value": "2022-05-18T09:45:00Z"
                 },
                 {
                     "name": "CACHE_BAD_ENVIRONMENTS_SECONDS",
@@ -160,7 +152,7 @@
                     "value": "60"
                 },
                 {
-                    "name":  "LOG_LEVEL",
+                    "name": "LOG_LEVEL",
                     "value": "INFO"
                 },
                 {
@@ -173,7 +165,43 @@
                 },
                 {
                     "name": "AUTO_SEAT_UPGRADE_PLANS",
-                    "value": "scale-up,scale-up-v2,scale-up-annual-v2"
+                    "value": "scale-up,scale-up-v2,scale-up-annual-v2,scale-up-24-months-v2"
+                },
+                {
+                    "name": "USE_POSTGRES_FOR_ANALYTICS",
+                    "value": "False"
+                },
+                {
+                    "name": "INFLUXDB_ORG",
+                    "value": "ben.rometsch@bullet-train.io"
+                },
+                {
+                    "name": "INFLUXDB_BUCKET",
+                    "value": "api_staging"
+                },
+                {
+                    "name": "INFLUXDB_URL",
+                    "value": "https://eu-central-1-1.aws.cloud2.influxdata.com"
+                },
+                {
+                    "name": "DEFAULT_THROTTLE_CLASSES",
+                    "value": "core.throttling.UserRateThrottle"
+                },
+                {
+                    "name": "USER_THROTTLE_CACHE_BACKEND",
+                    "value": "django_redis.cache.RedisCache"
+                },
+                {
+                    "name": "USER_THROTTLE_CACHE_LOCATION",
+                    "value": "rediss://serverless-redis-cache-7u3xil.serverless.euw2.cache.amazonaws.com:6379"
+                },
+                {
+                    "name": "USER_THROTTLE_CACHE_OPTIONS",
+                    "value": "CLIENT_CLASS=core.redis_cluster.SafeRedisClusterClient"
+                },
+                {
+                    "name": "GITHUB_APP_ID",
+                    "value": "811209"
                 }
             ],
             "secrets": [
@@ -206,10 +234,6 @@
                     "valueFrom": "arn:aws:secretsmanager:eu-west-2:302456015006:secret:ECS-API-heAdoB:INFLUXDB_TOKEN::"
                 },
                 {
-                    "name": "MAILERLITE_API_KEY",
-                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:302456015006:secret:ECS-API-heAdoB:MAILERLITE_API_KEY::"
-                },
-                {
                     "name": "OAUTH_CLIENT_SECRET",
                     "valueFrom": "arn:aws:secretsmanager:eu-west-2:302456015006:secret:ECS-API-heAdoB:OAUTH_CLIENT_SECRET::"
                 },
@@ -227,12 +251,19 @@
                 },
                 {
                     "name": "EDGE_REQUEST_SIGNING_KEY",
-                    "valueFrom":"arn:aws:secretsmanager:eu-west-2:302456015006:secret:ECS-API-heAdoB:EDGE_REQUEST_SIGNING_KEY::"
+                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:302456015006:secret:ECS-API-heAdoB:EDGE_REQUEST_SIGNING_KEY::"
                 },
-
                 {
                     "name": "SSE_AUTHENTICATION_TOKEN",
                     "valueFrom": "arn:aws:secretsmanager:eu-west-2:302456015006:secret:ECS-API-heAdoB:SSE_AUTHENTICATION_TOKEN::"
+                },
+                {
+                    "name": "GITHUB_WEBHOOK_SECRET",
+                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:302456015006:secret:ECS-API-heAdoB:GITHUB_WEBHOOK_SECRET::"
+                },
+                {
+                    "name": "GITHUB_PEM",
+                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:302456015006:secret:GITHUB_PEM-Bfoaql"
                 }
             ],
             "logConfiguration": {

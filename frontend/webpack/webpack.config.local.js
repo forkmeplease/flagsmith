@@ -3,9 +3,8 @@ const webpack = require('webpack');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 const path = require('path');
 
-const whitelabel = typeof process.env.WHITELABEL === 'undefined' ? false : process.env.WHITELABEL;
-const styles = whitelabel ? path.join(__dirname, `../web/styles/whitelabel/${process.env.WHITELABEL}`) : path.join(__dirname, '../web/styles');
-const base = require('./webpack.base');
+const base = require('../webpack.config');
+const ReactRefreshWebpackPlugin = require('@pmmmwh/react-refresh-webpack-plugin');
 
 module.exports = {
     ...base,
@@ -17,6 +16,7 @@ module.exports = {
         './web/main.js',
     ],
     devServer: {
+        hot: true,
         outputPath: __dirname,
     },
     output: {
@@ -28,16 +28,12 @@ module.exports = {
 
     plugins: require('./plugins').concat([
         new webpack.HotModuleReplacementPlugin(),
+        new ReactRefreshWebpackPlugin(),
         new webpack.DefinePlugin({
             __DEV__: true,
             whitelabel: JSON.stringify(process.env.WHITELABEL),
         }),
         new webpack.NoEmitOnErrorsPlugin(),
-        new webpack.ProvidePlugin({
-            $: 'jquery',
-            jQuery: 'jquery',
-            jquery: 'jquery',
-        }),
     ]).concat(require('./pages').map((page) => {
         // eslint-disable-next-line no-console
         console.log(page);

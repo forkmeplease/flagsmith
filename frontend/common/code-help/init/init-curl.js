@@ -1,4 +1,6 @@
-module.exports = envId => `
-curl 'https://edge.api.flagsmith.com/api/v1/flags/'
+import Constants from 'common/constants'
+
+module.exports = (envId) => `
+curl -i '${Constants.getFlagsmithSDKUrl()}flags/' \\
      -H 'x-environment-key: ${envId}'
-`;
+`

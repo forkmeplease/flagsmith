@@ -25,3 +25,7 @@ env.yaml
 .envrc
 .vercel
 common/project.js
+*.tsbuildinfo
+
+# Sentry Config File
+.env.sentry-build-plugin

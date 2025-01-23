@@ -1,14 +1,14 @@
 import logging
 
-from core.permissions import HasMasterAPIKey
+from common.projects.permissions import VIEW_PROJECT
 from django.utils.decorators import method_decorator
-from drf_yasg2.utils import swagger_auto_schema
+from drf_yasg.utils import swagger_auto_schema
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.generics import get_object_or_404
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from environments.models import Environment
 from features.feature_segments.serializers import (
     FeatureSegmentChangePrioritiesSerializer,
     FeatureSegmentCreateSerializer,
@@ -16,7 +16,11 @@ from features.feature_segments.serializers import (
     FeatureSegmentQuerySerializer,
 )
 from features.models import FeatureSegment
-from projects.models import Project
+from features.versioning.versioning_service import (
+    get_current_live_environment_feature_version,
+)
+
+from .permissions import FeatureSegmentPermissions
 
 logger = logging.getLogger(__name__)
 
@@ -25,26 +29,19 @@ logger = logging.getLogger(__name__)
     name="list",
     decorator=swagger_auto_schema(query_serializer=FeatureSegmentQuerySerializer()),
 )
-@method_decorator(
-    name="update_priorities",
-    decorator=swagger_auto_schema(
-        responses={200: FeatureSegmentListSerializer(many=True)}
-    ),
-)
 class FeatureSegmentViewSet(
     viewsets.ModelViewSet,
 ):
-    permission_classes = [IsAuthenticated | HasMasterAPIKey]
+    permission_classes = [FeatureSegmentPermissions]
 
     def get_queryset(self):
-        if hasattr(self.request, "master_api_key"):
-            permitted_projects = Project.objects.filter(
-                organisation_id=self.request.master_api_key.organisation_id
-            )
-        else:
-            permitted_projects = self.request.user.get_permitted_projects(
-                permissions=["VIEW_PROJECT"]
-            )
+        if getattr(self, "swagger_fake_view", False):
+            return FeatureSegment.objects.none()
+
+        permitted_projects = self.request.user.get_permitted_projects(
+            permission_key=VIEW_PROJECT
+        )
+
         queryset = FeatureSegment.objects.filter(
             feature__project__in=permitted_projects
         )
@@ -54,6 +51,17 @@ class FeatureSegmentViewSet(
                 data=self.request.query_params
             )
             filter_serializer.is_valid(raise_exception=True)
+
+            environment_id = filter_serializer.validated_data["environment"]
+            environment = Environment.objects.get(id=environment_id)
+            if environment.use_v2_feature_versioning:
+                queryset = queryset.filter(
+                    environment_feature_version=get_current_live_environment_feature_version(
+                        environment_id=environment_id,
+                        feature_id=filter_serializer.validated_data["feature"],
+                    )
+                )
+
             return queryset.select_related("segment").filter(**filter_serializer.data)
 
         return queryset

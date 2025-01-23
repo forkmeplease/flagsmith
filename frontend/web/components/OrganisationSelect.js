@@ -1,60 +1,58 @@
-import React, { Component } from 'react';
-import cx from 'classnames';
-import NavLink from 'react-router-dom/NavLink';
-import OrgSettingsIcon from './svg/OrgSettingsIcon';
-import OrganisationStore from '../../common/stores/organisation-store';
-import UserSettingsIcon from './svg/UserSettingsIcon';
-import EnvironmentSettingsIcon from './svg/EnvironmentSettingsIcon';
+import React, { Component } from 'react'
 
 const OrganisationSelect = class extends Component {
-	static displayName = 'OrganisationSelect'
+  static displayName = 'OrganisationSelect'
 
-	constructor(props, context) {
-	    super(props, context);
-	    this.state = {};
-	}
+  constructor(props, context) {
+    super(props, context)
+    this.state = {}
+  }
 
-	render() {
-	    return (
-    <AccountProvider>
-        {({ isLoading, user }) => (
-            <div>
-                {user && user.organisations && user.organisations.map(organisation => (
-                    <div key={organisation.id}>
-                        <Row className={cx('popover-bt__list-item', { active: AccountStore.getOrganisation().id === organisation.id })}>
-                            <a
+  componentDidMount() {
+    if (localStorage.lastEnv) {
+      const orgId = JSON.parse(localStorage.lastEnv).orgId
+      if (this.props.firstOrganisation && orgId) {
+        this.props.onChange(orgId)
+      }
+    }
+  }
 
-                              href="#" onClick={() => {
-								API.setCookie("organisation", `${organisation.id}`)
-								this.props.onChange && this.props.onChange(organisation);
-                              }}
-                            >
-                                {organisation.name}
-                            </a>
-                            {AccountStore.getOrganisationRole() === 'ADMIN' && (
-                            <NavLink
-                              id="organisation-settings-link"
-                              activeClassName="active"
-                              onClick={() => {
-															    this.props.onChange && this.props.onChange(organisation);
-                              }}
-                              className="btn btn-link btn-sm edit"
-                              to="/organisation-settings"
-                            >
-                                <span style={{ fontSize: 16, marginRight: 4 }} className="icon--primary ion ion-md-settings"/>
-                                {'Manage'}
-                            </NavLink>
-                            )}
-                        </Row>
-                    </div>
-                ))}
+  render() {
+    return (
+      <AccountProvider>
+        {({ user }) => (
+          <Row>
+            <div style={{ width: '500px' }}>
+              <Select
+                value={{
+                  label: AccountStore.getOrganisation().name,
+                  value: AccountStore.getOrganisation().id,
+                }}
+                onChange={({ value }) => {
+                  this.props.onChange && this.props.onChange(value)
+                }}
+                options={
+                  user &&
+                  user.organisations &&
+                  user.organisations.map((organisation) => {
+                    return { label: organisation.name, value: organisation.id }
+                  })
+                }
+                className='select-lg react-select'
+              />
             </div>
+            {user &&
+              user.organisations &&
+              user.organisations.map((organisation) => (
+                <div key={organisation.id}></div>
+              ))}
+          </Row>
         )}
-    </AccountProvider>
-	    );
-	}
-};
+      </AccountProvider>
+    )
+  }
+}
 
-OrganisationSelect.propTypes = {};
+OrganisationSelect.propTypes = {}
 
-module.exports = OrganisationSelect;
+export default OrganisationSelect

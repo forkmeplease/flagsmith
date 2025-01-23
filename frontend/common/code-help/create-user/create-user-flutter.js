@@ -1,5 +1,14 @@
-module.exports = (envId, { USER_ID, FEATURE_NAME, FEATURE_NAME_ALT }) => `final flagsmithClient = FlagsmithClient(
-        apiKey: '${envId}' 
+import Constants from 'common/constants'
+module.exports = (
+  envId,
+  { FEATURE_NAME, FEATURE_NAME_ALT, USER_ID },
+  userId,
+) => `final flagsmithClient = FlagsmithClient(
+        apiKey: '${envId}',${
+  Constants.isCustomFlagsmithUrl()
+    ? `\n        baseURI: '${Constants.getFlagsmithSDKUrl()}',`
+    : ''
+}
         config: config, 
         seeds: <Flag>[
             Flag.seed('feature', enabled: true),
@@ -8,7 +17,11 @@ module.exports = (envId, { USER_ID, FEATURE_NAME, FEATURE_NAME_ALT }) => `final 
 
 //if you prefer async initialization then you should use
 //final flagsmithClient = await FlagsmithClient.init(
-//        apiKey: 'YOUR_ENV_API_KEY',
+//        apiKey: '${envId}',${
+  Constants.isCustomFlagsmithUrl()
+    ? `\n//        baseURI: '${Constants.getFlagsmithSDKUrl()}',`
+    : ''
+}
 //        config: config, 
 //        seeds: <Flag>[
 //            Flag.seed('feature', enabled: true),
@@ -17,7 +30,7 @@ module.exports = (envId, { USER_ID, FEATURE_NAME, FEATURE_NAME_ALT }) => `final 
 //    );
 
 // This will create a user in the dashboard if they don't already exist
-final user = Identity(identifier: '${USER_ID}');
+final user = Identity(identifier: '${userId || USER_ID}');
 
 bool featureEnabled = await flagsmithClient
   .hasFeatureFlag('${FEATURE_NAME}', user: user);
@@ -25,4 +38,4 @@ bool featureEnabled = await flagsmithClient
 final myRemoteConfig = await flagsmithClient
   .getFeatureFlagValue('${FEATURE_NAME_ALT}', user: user);
 
-`;
+`

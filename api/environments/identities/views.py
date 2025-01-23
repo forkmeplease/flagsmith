@@ -1,9 +1,15 @@
+import typing
 from collections import namedtuple
 
+from common.environments.permissions import MANAGE_IDENTITIES, VIEW_IDENTITIES
+from core.constants import FLAGSMITH_UPDATED_AT_HEADER
+from core.request_origin import RequestOrigin
 from django.conf import settings
+from django.db.models import Q
+from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
-from drf_yasg2.utils import swagger_auto_schema
+from drf_yasg.utils import swagger_auto_schema
 from rest_framework import status, viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -16,23 +22,17 @@ from environments.identities.serializers import (
     SDKIdentitiesQuerySerializer,
     SDKIdentitiesResponseSerializer,
 )
-from environments.identities.traits.serializers import TraitSerializerBasic
 from environments.models import Environment
-from environments.permissions.constants import (
-    MANAGE_IDENTITIES,
-    VIEW_IDENTITIES,
-)
 from environments.permissions.permissions import NestedEnvironmentPermissions
 from environments.sdk.serializers import (
     IdentifyWithTraitsSerializer,
     IdentitySerializerWithTraitsAndSegments,
 )
-from features.serializers import FeatureStateSerializerFull
+from features.serializers import SDKFeatureStateSerializer
 from integrations.integration import (
     IDENTITY_INTEGRATIONS,
     identify_integrations,
 )
-from sse.decorators import generate_identity_update_message
 from util.views import SDKAPIView
 
 
@@ -41,6 +41,9 @@ class IdentityViewSet(viewsets.ModelViewSet):
     pagination_class = CustomPagination
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return Identity.objects.none()
+
         environment = self.get_environment_from_request()
         queryset = Identity.objects.filter(environment=environment)
 
@@ -100,6 +103,7 @@ class SDKIdentitiesDeprecated(SDKAPIView):
     # if Identity does not exist it will create one, otherwise will fetch existing
 
     serializer_class = IdentifyWithTraitsSerializer
+    throttle_classes = []
 
     schema = None
 
@@ -107,11 +111,11 @@ class SDKIdentitiesDeprecated(SDKAPIView):
     def get(self, request, identifier, *args, **kwargs):
         # if we have identifier fetch, or create if does not exist
         if identifier:
-            identity, _ = Identity.objects.get_or_create(
+            identity, _ = Identity.objects.get_or_create_for_sdk(
                 identifier=identifier,
                 environment=request.environment,
+                integrations=IDENTITY_INTEGRATIONS,
             )
-
         else:
             return Response(
                 {"detail": "Missing identifier"}, status=status.HTTP_400_BAD_REQUEST
@@ -147,6 +151,7 @@ class SDKIdentitiesDeprecated(SDKAPIView):
 class SDKIdentities(SDKAPIView):
     serializer_class = IdentifyWithTraitsSerializer
     pagination_class = None  # set here to ensure documentation is correct
+    throttle_classes = []
 
     @swagger_auto_schema(
         responses={200: SDKIdentitiesResponseSerializer()},
@@ -166,18 +171,20 @@ class SDKIdentities(SDKAPIView):
                 {"detail": "Missing identifier"}
             )  # TODO: add 400 status - will this break the clients?
 
-        identity, _ = (
-            Identity.objects.select_related(
-                "environment",
-                "environment__project",
-                *[
-                    f"environment__{integration['relation_name']}"
-                    for integration in IDENTITY_INTEGRATIONS
-                ],
+        if request.query_params.get("transient"):
+            identity = Identity(
+                created_date=timezone.now(),
+                identifier=identifier,
+                environment=request.environment,
             )
-            .prefetch_related("identity_traits")
-            .get_or_create(identifier=identifier, environment=request.environment)
-        )
+        else:
+            identity, _ = Identity.objects.get_or_create_for_sdk(
+                identifier=identifier,
+                environment=request.environment,
+                integrations=IDENTITY_INTEGRATIONS,
+            )
+        self.identity = identity
+
         if settings.EDGE_API_URL and request.environment.project.enable_dynamo_db:
             forward_identity_request.delay(
                 args=(
@@ -188,11 +195,25 @@ class SDKIdentities(SDKAPIView):
                 kwargs={"query_params": request.GET.dict()},
             )
 
+        # Note that we send the environment updated_at value here since it covers most use cases
+        # in which an identity will need updated flags. It will not cover identity overrides or
+        # adding traits to the identity (which adds / removes them to / from segments).
+        # TODO: handle identity overrides.
+        headers = {
+            FLAGSMITH_UPDATED_AT_HEADER: request.environment.updated_at.timestamp()
+        }
+
         feature_name = request.query_params.get("feature")
         if feature_name:
-            return self._get_single_feature_state_response(identity, feature_name)
+            response = self._get_single_feature_state_response(
+                identity, feature_name, headers=headers
+            )
         else:
-            return self._get_all_feature_states_for_user_response(identity)
+            response = self._get_all_feature_states_for_user_response(
+                identity, headers=headers
+            )
+
+        return response
 
     def get_serializer_context(self):
         context = super(SDKIdentities, self).get_serializer_context()
@@ -200,13 +221,11 @@ class SDKIdentities(SDKAPIView):
             # only set it if the request has the attribute to ensure that the
             # documentation works correctly still
             context["environment"] = self.request.environment
+            if getattr(self, "identity", None):
+                context["identity"] = self.identity
+        context["feature_states_additional_filters"] = self._get_additional_filters()
         return context
 
-    @method_decorator(
-        generate_identity_update_message(
-            lambda req: (req.environment, req.data["identifier"])
-        )
-    )
     @swagger_auto_schema(
         request_body=IdentifyWithTraitsSerializer(),
         responses={200: SDKIdentitiesResponseSerializer()},
@@ -216,6 +235,7 @@ class SDKIdentities(SDKAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         instance = serializer.save()
+        self.identity = instance.get("identity")
 
         if settings.EDGE_API_URL and request.environment.project.enable_dynamo_db:
             forward_identity_request.delay(
@@ -231,40 +251,69 @@ class SDKIdentities(SDKAPIView):
         # trait values are serialized correctly
         response_serializer = IdentifyWithTraitsSerializer(
             instance=instance,
-            context={"identity": instance.get("identity")},  # todo: improve this
+            context=self.get_serializer_context(),
         )
-        return Response(response_serializer.data)
+        return Response(
+            response_serializer.data,
+            headers={
+                FLAGSMITH_UPDATED_AT_HEADER: request.environment.updated_at.timestamp()
+            },
+        )
 
-    def _get_single_feature_state_response(self, identity, feature_name):
-        for feature_state in identity.get_all_feature_states():
+    def _get_additional_filters(self) -> Q | None:
+        if self.request.originated_from is RequestOrigin.CLIENT:
+            return Q(feature__is_server_key_only=False)
+        return None
+
+    def _get_single_feature_state_response(
+        self,
+        identity: Identity,
+        feature_name: str,
+        headers: dict[str, typing.Any],
+    ) -> Response:
+        context = self.get_serializer_context()
+
+        for feature_state in identity.get_all_feature_states(
+            additional_filters=self._get_additional_filters(),
+        ):
             if feature_state.feature.name == feature_name:
-                serializer = FeatureStateSerializerFull(
-                    feature_state, context={"identity": identity}
+                serializer = SDKFeatureStateSerializer(feature_state, context=context)
+                return Response(
+                    data=serializer.data, status=status.HTTP_200_OK, headers=headers
                 )
-                return Response(data=serializer.data, status=status.HTTP_200_OK)
 
         return Response(
-            {"detail": "Given feature not found"}, status=status.HTTP_404_NOT_FOUND
+            {"detail": "Given feature not found"},
+            status=status.HTTP_404_NOT_FOUND,
+            headers=headers,
         )
 
-    def _get_all_feature_states_for_user_response(self, identity, trait_models=None):
+    def _get_all_feature_states_for_user_response(
+        self,
+        identity: Identity,
+        headers: dict[str, typing.Any],
+    ):
         """
         Get all feature states for an identity
 
         :param identity: Identity model to return feature states for
-        :param trait_models: optional list of trait_models to pass in for organisations that don't persist them
         :return: Response containing lists of both serialized flags and traits
         """
-        all_feature_states = identity.get_all_feature_states()
-        serialized_flags = FeatureStateSerializerFull(
-            all_feature_states, many=True, context={"identity": identity}
+        all_feature_states = identity.get_all_feature_states(
+            additional_filters=self._get_additional_filters(),
         )
-        serialized_traits = TraitSerializerBasic(
-            identity.identity_traits.all(), many=True
+        serializer_class = self.get_serializer_class()
+        serializer = serializer_class(
+            {
+                "flags": all_feature_states,
+                "identifier": identity.identifier,
+                "traits": identity.identity_traits.all() if identity.id else [],
+            },
+            context=self.get_serializer_context(),
         )
 
         identify_integrations(identity, all_feature_states)
 
-        response = {"flags": serialized_flags.data, "traits": serialized_traits.data}
-
-        return Response(data=response, status=status.HTTP_200_OK)
+        return Response(
+            data=serializer.data, status=status.HTTP_200_OK, headers=headers
+        )

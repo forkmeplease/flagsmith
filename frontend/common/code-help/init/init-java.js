@@ -1,6 +1,17 @@
-module.exports = (envId, { LIB_NAME, LIB_NAME_JAVA, FEATURE_NAME, FEATURE_NAME_ALT }, customFeature) => `${LIB_NAME_JAVA} ${LIB_NAME} = ${LIB_NAME_JAVA}
+import Constants from 'common/constants'
+module.exports = (
+  envId,
+  { FEATURE_NAME, FEATURE_NAME_ALT, LIB_NAME, LIB_NAME_JAVA },
+  customFeature,
+) => `${LIB_NAME_JAVA} ${LIB_NAME} = ${LIB_NAME_JAVA}
     .newBuilder()
-    .setApiKey("${envId}")
+    .setApiKey("${envId}")${
+  Constants.isCustomFlagsmithUrl()
+    ? `\n    .withConfiguration(FlagsmithConfig.newBuilder()
+        .baseUri("${Constants.getFlagsmithSDKUrl()}")
+        .build())`
+    : ''
+}
     .build();
 
 Flags flags = flagsmith.getEnvironmentFlags();
@@ -9,5 +20,7 @@ Flags flags = flagsmith.getEnvironmentFlags();
 boolean isEnabled = flags.isFeatureEnabled("${customFeature || FEATURE_NAME}");
 
 // Or, use the value of a feature
-Object featureValue = flags.GetFeatureValue("${customFeature || FEATURE_NAME_ALT}");
-`;
+Object featureValue = flags.getFeatureValue("${
+  customFeature || FEATURE_NAME_ALT
+}");
+`

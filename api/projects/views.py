@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
+from common.projects.permissions import TAG_SUPPORTED_PERMISSIONS, VIEW_PROJECT
 from django.conf import settings
 from django.utils.decorators import method_decorator
-from drf_yasg2 import openapi
-from drf_yasg2.utils import no_body, swagger_auto_schema
+from drf_yasg import openapi
+from drf_yasg.utils import no_body, swagger_auto_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import ValidationError
@@ -16,6 +17,7 @@ from rest_framework.response import Response
 from environments.dynamodb.migrator import IdentityMigrator
 from environments.identities.models import Identity
 from environments.serializers import EnvironmentSerializerLight
+from permissions.permissions_calculator import get_project_permission_data
 from permissions.serializers import (
     PermissionModelSerializer,
     UserObjectPermissionsSerializer,
@@ -23,25 +25,25 @@ from permissions.serializers import (
 from projects.exceptions import (
     DynamoNotEnabledError,
     ProjectMigrationError,
+    ProjectTooLargeError,
     TooManyIdentitiesError,
 )
 from projects.models import (
+    Project,
     ProjectPermissionModel,
     UserPermissionGroupProjectPermission,
     UserProjectPermission,
 )
-from projects.permissions import (
-    IsProjectAdmin,
-    MasterAPIKeyProjectPermissions,
-    ProjectPermissions,
-)
-from projects.permissions_calculator import ProjectPermissionsCalculator
+from projects.permissions import IsProjectAdmin, ProjectPermissions
 from projects.serializers import (
     CreateUpdateUserPermissionGroupProjectPermissionSerializer,
     CreateUpdateUserProjectPermissionSerializer,
     ListUserPermissionGroupProjectPermissionSerializer,
     ListUserProjectPermissionSerializer,
-    ProjectSerializer,
+    ProjectCreateSerializer,
+    ProjectListSerializer,
+    ProjectRetrieveSerializer,
+    ProjectUpdateSerializer,
 )
 
 
@@ -67,17 +69,27 @@ from projects.serializers import (
     ),
 )
 class ProjectViewSet(viewsets.ModelViewSet):
-    serializer_class = ProjectSerializer
-    permission_classes = [ProjectPermissions | MasterAPIKeyProjectPermissions]
+    permission_classes = [ProjectPermissions]
+
+    def get_serializer_class(self):
+        serializers = {
+            "retrieve": ProjectRetrieveSerializer,
+            "create": ProjectCreateSerializer,
+            "update": ProjectUpdateSerializer,
+            "partial_update": ProjectUpdateSerializer,
+        }
+        return serializers.get(self.action, ProjectListSerializer)
+
     pagination_class = None
 
+    def get_serializer_context(self):
+        return super().get_serializer_context()
+
     def get_queryset(self):
-        if hasattr(self.request, "master_api_key"):
-            queryset = self.request.master_api_key.organisation.projects.all()
-        else:
-            queryset = self.request.user.get_permitted_projects(
-                permissions=["VIEW_PROJECT"]
-            )
+        if getattr(self, "swagger_fake_view", False):
+            return Project.objects.none()
+
+        queryset = self.request.user.get_permitted_projects(permission_key=VIEW_PROJECT)
 
         organisation_id = self.request.query_params.get("organisation")
         if organisation_id:
@@ -91,12 +103,10 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         project = serializer.save()
-        if self.request.user.is_anonymous:
-            return
-
-        UserProjectPermission.objects.create(
-            user=self.request.user, project=project, admin=True
-        )
+        if getattr(self.request.user, "is_master_api_key_user", False) is False:
+            UserProjectPermission.objects.create(
+                user=self.request.user, project=project, admin=True
+            )
 
     @action(
         detail=False,
@@ -116,13 +126,15 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return Response(EnvironmentSerializerLight(environments, many=True).data)
 
     @swagger_auto_schema(
-        responses={200: PermissionModelSerializer}, request_body=no_body
+        responses={200: PermissionModelSerializer(many=True)}, request_body=no_body
     )
     @action(detail=False, methods=["GET"])
     def permissions(self, *args, **kwargs):
         return Response(
             PermissionModelSerializer(
-                instance=ProjectPermissionModel.objects.all(), many=True
+                instance=ProjectPermissionModel.objects.all(),
+                many=True,
+                context={"tag_supported_permissions": TAG_SUPPORTED_PERMISSIONS},
             ).data
         )
 
@@ -134,19 +146,14 @@ class ProjectViewSet(viewsets.ModelViewSet):
         url_name="my-permissions",
     )
     def user_permissions(self, request: Request, pk: int = None):
-        if request.user.is_anonymous:
+        if getattr(request.user, "is_master_api_key_user", False) is True:
             return Response(
                 status=status.HTTP_400_BAD_REQUEST,
                 data={
                     "detail": "This endpoint can only be used with a user and not Master API Key"
                 },
             )
-        project_permissions_calculator = ProjectPermissionsCalculator(project_id=pk)
-        permission_data = (
-            project_permissions_calculator.get_user_project_permission_data(
-                user_id=request.user.id
-            )
-        )
+        permission_data = get_project_permission_data(pk, user_id=request.user.id)
         serializer = UserObjectPermissionsSerializer(instance=permission_data)
         return Response(serializer.data)
 
@@ -163,6 +170,9 @@ class ProjectViewSet(viewsets.ModelViewSet):
             raise DynamoNotEnabledError()
 
         project = self.get_object()
+        if project.is_too_large:
+            raise ProjectTooLargeError()
+
         identity_count = Identity.objects.filter(environment__project=project).count()
 
         if identity_count > settings.MAX_SELF_MIGRATABLE_IDENTITIES:
@@ -183,6 +193,9 @@ class BaseProjectPermissionsViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsProjectAdmin]
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return self.model_class.objects.none()
+
         if not self.kwargs.get("project_pk"):
             raise ValidationError("Missing project pk.")
 
@@ -221,15 +234,7 @@ class UserPermissionGroupProjectPermissionsViewSet(BaseProjectPermissionsViewSet
 def get_user_project_permissions(request, **kwargs):
     user_id = kwargs["user_pk"]
 
-    project_permissions_calculator = ProjectPermissionsCalculator(kwargs["project_pk"])
-    user_permissions_data = (
-        project_permissions_calculator.get_user_project_permission_data(user_id)
-    )
-
+    permission_data = get_project_permission_data(kwargs["project_pk"], user_id=user_id)
     # TODO: expose `user` and `groups` attributes from user_permissions_data
-    return Response(
-        {
-            "admin": user_permissions_data.admin,
-            "permissions": user_permissions_data.permissions,
-        }
-    )
+    serializer = UserObjectPermissionsSerializer(instance=permission_data)
+    return Response(serializer.data)

@@ -11,9 +11,20 @@ from environments.identities.serializers import (
 from environments.identities.traits.fields import TraitValueField
 from environments.identities.traits.models import Trait
 from environments.identities.traits.serializers import TraitSerializerBasic
-from features.serializers import FeatureStateSerializerFull
+from environments.sdk.services import (
+    get_identified_transient_identity_and_traits,
+    get_persisted_identity_and_traits,
+    get_transient_identity_and_traits,
+)
+from environments.sdk.types import SDKTraitData
+from features.serializers import (
+    FeatureStateSerializerFull,
+    SDKFeatureStateSerializer,
+)
 from integrations.integration import identify_integrations
 from segments.serializers import SegmentSerializerBasic
+
+from .serializers_mixins import HideSensitiveFieldsSerializerMixin
 
 
 class SDKCreateUpdateTraitSerializer(serializers.ModelSerializer):
@@ -36,9 +47,11 @@ class SDKCreateUpdateTraitSerializer(serializers.ModelSerializer):
 
         defaults = {
             value_key: trait_value,
-            "value_type": trait_value_type
-            if trait_value_type in [FLOAT, INTEGER, BOOLEAN]
-            else STRING,
+            "value_type": (
+                trait_value_type
+                if trait_value_type in [FLOAT, INTEGER, BOOLEAN]
+                else STRING
+            ),
         }
 
         return Trait.objects.update_or_create(
@@ -114,40 +127,65 @@ class IdentitySerializerWithTraitsAndSegments(serializers.Serializer):
     segments = SegmentSerializerBasic(many=True)
 
 
-class IdentifyWithTraitsSerializer(serializers.Serializer):
-    identifier = serializers.CharField(write_only=True, required=True)
+class IdentifyWithTraitsSerializer(
+    HideSensitiveFieldsSerializerMixin, serializers.Serializer
+):
+    identifier = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+    )
+    transient = serializers.BooleanField(write_only=True, default=False)
     traits = TraitSerializerBasic(required=False, many=True)
-    flags = FeatureStateSerializerFull(read_only=True, many=True)
+    flags = SDKFeatureStateSerializer(read_only=True, many=True)
+
+    sensitive_fields = ("traits",)
 
     def save(self, **kwargs):
         """
         Create the identity with the associated traits
         (optionally store traits if flag set on org)
         """
+        identifier = self.validated_data.get("identifier")
         environment = self.context["environment"]
-        identity, created = Identity.objects.get_or_create(
-            identifier=self.validated_data["identifier"], environment=environment
-        )
+        transient = self.validated_data["transient"]
+        sdk_trait_data: list[SDKTraitData] = self.validated_data.get("traits", [])
 
-        trait_data_items = self.validated_data.get("traits", [])
-
-        if not created and environment.project.organisation.persist_trait_data:
-            # if this is an update and we're persisting traits, then we need to
-            # partially update any traits and return the full list
-            trait_models = identity.update_traits(trait_data_items)
-        else:
-            # generate traits for the identity and store them if configured to do so
-            trait_models = identity.generate_traits(
-                trait_data_items,
-                persist=environment.project.organisation.persist_trait_data,
+        if not identifier:
+            # We have a fully transient identity that should never be persisted.
+            identity, traits = get_transient_identity_and_traits(
+                environment=environment,
+                sdk_trait_data=sdk_trait_data,
             )
 
-        all_feature_states = identity.get_all_feature_states(traits=trait_models)
-        identify_integrations(identity, all_feature_states, trait_models)
+        elif transient:
+            # Don't persist incoming data but load presently stored
+            # overrides and traits, if any.
+            identity, traits = get_identified_transient_identity_and_traits(
+                environment=environment,
+                identifier=identifier,
+                sdk_trait_data=sdk_trait_data,
+            )
+
+        else:
+            # Persist the identity in accordance with individual trait transiency
+            # and persistence settings outside of request context.
+            identity, traits = get_persisted_identity_and_traits(
+                environment=environment,
+                identifier=identifier,
+                sdk_trait_data=sdk_trait_data,
+            )
+
+        all_feature_states = identity.get_all_feature_states(
+            traits=traits,
+            additional_filters=self.context.get("feature_states_additional_filters"),
+        )
+        identify_integrations(identity, all_feature_states, traits)
 
         return {
             "identity": identity,
-            "traits": trait_models,
+            "identifier": identity.identifier,
+            "traits": traits,
             "flags": all_feature_states,
         }
 
