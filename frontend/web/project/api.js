@@ -273,7 +273,10 @@ global.API = {
         if (plan && plan.includes('start-up')) {
           return planNames.startup
         }
-        if (global.flagsmithVersion?.backend.is_enterprise || (plan && plan.includes('enterprise'))) {
+        if (
+          global.flagsmithVersion?.backend.is_enterprise ||
+          (plan && plan.includes('enterprise'))
+        ) {
           return planNames.enterprise
         }
         return planNames.free
@@ -320,6 +323,11 @@ global.API = {
           .set('organisation', selectedOrgName)
           .set('role', selectedRole)
           .set('plan', selectedPlanName)
+          .set(
+            'tasks',
+            (user.onboarding?.tasks || [])?.map((v) => v.name),
+          )
+          .set('integrations', user.onboarding?.tools?.selection || [])
 
         amplitude.identify(identify)
       }
