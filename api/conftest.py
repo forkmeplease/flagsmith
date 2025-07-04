@@ -21,6 +21,7 @@ from flag_engine.segments.constants import EQUAL
 from moto import mock_dynamodb  # type: ignore[import-untyped]
 from mypy_boto3_dynamodb.service_resource import DynamoDBServiceResource, Table
 from pyfakefs.fake_filesystem import FakeFilesystem
+from pytest import FixtureRequest
 from pytest_django.fixtures import SettingsWrapper
 from pytest_django.plugin import blocking_manager_key
 from pytest_mock import MockerFixture
@@ -78,6 +79,7 @@ from projects.models import (
 )
 from projects.tags.models import Tag
 from segments.models import Condition, Segment, SegmentRule
+from segments.services import SegmentCloneService
 from tests.test_helpers import fix_issue_3869
 from tests.types import (
     AdminClientAuthType,
@@ -147,7 +149,11 @@ def fs(fs: FakeFilesystem) -> FakeFilesystem:
     """
     app_path = os.path.dirname(os.path.abspath(__file__))
     site_packages = site.getsitepackages()  # Allow files within dependencies
-    fs.add_real_paths([*site_packages, app_path])
+    paths_to_add = [app_path]
+    for site_package_path in site_packages:
+        if not site_package_path.startswith(app_path):
+            paths_to_add.append(site_package_path)
+    fs.add_real_paths(paths_to_add)
     return fs
 
 
@@ -387,7 +393,7 @@ def segment(project: Project):  # type: ignore[no-untyped-def]
     _segment = Segment.objects.create(name="segment", project=project)
     # Deep clone the segment to ensure that any bugs around
     # versioning get bubbled up through the test suite.
-    _segment.deep_clone()
+    SegmentCloneService(_segment).deep_clone()
 
     return _segment
 
@@ -542,8 +548,8 @@ def multivariate_options(
 
 
 @pytest.fixture()
-def identity_matching_segment(project, trait):  # type: ignore[no-untyped-def]
-    segment = Segment.objects.create(name="Matching segment", project=project)
+def identity_matching_segment(project: Project, trait: Trait) -> Segment:
+    segment: Segment = Segment.objects.create(name="Matching segment", project=project)
     matching_rule = SegmentRule.objects.create(
         segment=segment, type=SegmentRule.ALL_RULE
     )
@@ -557,7 +563,7 @@ def identity_matching_segment(project, trait):  # type: ignore[no-untyped-def]
 
 
 @pytest.fixture()
-def api_client():  # type: ignore[no-untyped-def]
+def api_client() -> APIClient:
     return APIClient()
 
 
@@ -586,10 +592,13 @@ def feature_state(feature: Feature, environment: Environment) -> FeatureState:
 
 
 @pytest.fixture()
-def feature_state_with_value(environment: Environment) -> FeatureState:
+def feature_state_with_value(
+    environment: Environment, request: FixtureRequest
+) -> FeatureState:
+    initial_value = getattr(request, "param", "foo")
     feature = Feature.objects.create(
         name="feature_with_value",
-        initial_value="foo",
+        initial_value=initial_value,
         default_enabled=True,
         project=environment.project,
     )

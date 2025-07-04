@@ -12,22 +12,23 @@ import DiffString from 'components/diff/DiffString'
 import DiffEnabled from 'components/diff/DiffEnabled'
 import Format from 'common/utils/format'
 import { Environment } from 'common/types/responses'
-import { Link } from 'react-router-dom'
+import { Link, useRouteMatch } from 'react-router-dom'
 import Button from 'components/base/forms/Button'
-type AuditLogItemPageType = {
-  match: {
-    params: {
-      environmentId: string
-      projectId: string
-      id: string
-    }
-  }
+import { useRouteContext } from 'components/providers/RouteContext'
+
+interface RouteParams {
+  environmentId: string
+  projectId: string
+  id: string
 }
 
-const AuditLogItemPage: FC<AuditLogItemPageType> = ({ match }) => {
+const AuditLogItemPage: FC = () => {
+  const match = useRouteMatch<RouteParams>()
+  const { projectId } = useRouteContext()
+
   const { data, error, isLoading } = useGetAuditLogItemQuery({
     id: match.params.id,
-    projectId: match.params.projectId,
+    projectId: projectId?.toString() || '',
   })
 
   const index = (ProjectStore.getEnvs() as Environment[] | null)?.findIndex(
@@ -43,7 +44,7 @@ const AuditLogItemPage: FC<AuditLogItemPageType> = ({ match }) => {
         items={[
           {
             title: 'Audit Log',
-            url: `/project/${match.params.projectId}/audit-log`,
+            url: `/project/${projectId}/audit-log`,
           },
         ]}
         currentPage={match.params.id}
