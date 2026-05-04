@@ -45,10 +45,14 @@ jobs:
         run: npm ci
 
       - name: Publish to Chromatic
-        uses: chromaui/action@v11
+        uses: chromaui/action@v16
         with:
           workingDir: frontend
           projectToken: ${{ secrets.CHROMATIC_PROJECT_TOKEN }}
+          # Dev-mode build keeps React's act() in the bundle —
+          # production strips it and breaks play function synthetic
+          # events (Storybook #19758).
+          buildScriptName: build-storybook:dev
           exitZeroOnChanges: true
           exitOnceUploaded: true
           onlyChanged: true
